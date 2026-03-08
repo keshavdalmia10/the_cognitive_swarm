@@ -17,6 +17,7 @@ async function startServer() {
 
   // Global State for the Swarm
   let state = {
+    topic: 'Schema Design',
     phase: 'divergent', // 'divergent' | 'convergent' | 'forging'
     ideas: [] as { id: string, text: string, weight: number, cluster: string, authorId: string, authorName: string }[],
     mermaidCode: "graph TD;\n  Swarm[The Swarm] --> Ideas[Ideas];",
@@ -27,6 +28,12 @@ async function startServer() {
     
     // Send initial state
     socket.emit("state_sync", state);
+
+    // Update topic
+    socket.on("set_topic", (topic: string) => {
+      state.topic = topic;
+      io.emit("topic_updated", state.topic);
+    });
 
     // Ingestion Task: Receive new ideas from clients (extracted via Gemini)
     socket.on("add_idea", (idea: { text: string, cluster: string, authorName?: string }) => {

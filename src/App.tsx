@@ -18,6 +18,8 @@ export default function App() {
   const [role, setRole] = useState<'admin' | 'participant' | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [phase, setPhase] = useState<'divergent' | 'convergent' | 'forging'>('divergent');
+  const [topic, setTopic] = useState<string>('Schema Design');
+  const [isEditingTopic, setIsEditingTopic] = useState(false);
   const [ideas, setIdeas] = useState<any[]>([]);
   const ideasRef = useRef<any[]>([]);
   useEffect(() => { ideasRef.current = ideas; }, [ideas]);
@@ -36,9 +38,14 @@ export default function App() {
     setSocket(newSocket);
 
     newSocket.on('state_sync', (state) => {
+      setTopic(state.topic || 'Schema Design');
       setPhase(state.phase);
       setIdeas(state.ideas);
       setMermaidCode(state.mermaidCode);
+    });
+
+    newSocket.on('topic_updated', (newTopic) => {
+      setTopic(newTopic);
     });
 
     newSocket.on('idea_added', (idea) => {
@@ -328,9 +335,46 @@ export default function App() {
       <header className="flex items-center justify-between p-6 border-b border-white/10 bg-black/50 backdrop-blur-md z-10">
         <div className="flex items-center gap-3">
           <BrainCircuit className="w-8 h-8 text-[#00FF00]" />
-          <h1 className="text-2xl font-bold tracking-tight uppercase" style={{ fontFamily: "'Anton', sans-serif" }}>
-            The Cognitive Swarm: Schema Design
-          </h1>
+          <div className="flex flex-col">
+            <h1 className="text-2xl font-bold tracking-tight uppercase leading-none" style={{ fontFamily: "'Anton', sans-serif" }}>
+              The Cognitive Swarm
+            </h1>
+            {role === 'admin' ? (
+              <div className="flex items-center mt-1">
+                {isEditingTopic ? (
+                  <input
+                    type="text"
+                    value={topic}
+                    onChange={(e) => setTopic(e.target.value)}
+                    onBlur={() => {
+                      setIsEditingTopic(false);
+                      socket?.emit('set_topic', topic);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        setIsEditingTopic(false);
+                        socket?.emit('set_topic', topic);
+                      }
+                    }}
+                    autoFocus
+                    className="bg-white/10 border border-[#00FF00]/50 rounded px-2 py-0.5 text-sm text-[#00FF00] font-mono focus:outline-none w-64"
+                  />
+                ) : (
+                  <div 
+                    onClick={() => setIsEditingTopic(true)}
+                    className="text-sm text-[#00FF00] font-mono cursor-pointer hover:underline"
+                    title="Click to edit topic"
+                  >
+                    Topic: {topic}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="text-sm text-[#00FF00] font-mono mt-1">
+                Topic: {topic}
+              </div>
+            )}
+          </div>
         </div>
         
         <div className="flex items-center gap-4">
