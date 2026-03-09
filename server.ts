@@ -17,11 +17,28 @@ async function startServer() {
 
   // Global State for the Swarm
   let state = {
-    topic: 'Schema Design',
+    topic: '',
     phase: 'divergent', // 'divergent' | 'convergent' | 'forging'
     ideas: [] as { id: string, text: string, weight: number, cluster: string, authorId: string, authorName: string }[],
-    mermaidCode: "graph TD;\n  Swarm[The Swarm] --> Ideas[Ideas];",
+    flowData: { nodes: [], edges: [] } as { nodes: any[], edges: any[] },
   };
+
+  let pendingIdeas: any[] = [];
+  let pendingUpdates: any[] = [];
+
+  // Batch broadcast every 1.5 seconds
+  setInterval(() => {
+    if (pendingIdeas.length > 0) {
+      io.emit("ideas_batch_added", pendingIdeas);
+      pendingIdeas = [];
+    }
+    if (pendingUpdates.length > 0) {
+      // Deduplicate updates (keep the latest state for each idea ID)
+      const uniqueUpdates = Array.from(new Map(pendingUpdates.map(item => [item.id, item])).values());
+      io.emit("ideas_batch_updated", uniqueUpdates);
+      pendingUpdates = [];
+    }
+  }, 1500);
 
   io.on("connection", (socket) => {
     console.log("Client connected:", socket.id);
@@ -46,23 +63,30 @@ async function startServer() {
         authorName: idea.authorName || 'Anonymous Node'
       };
       state.ideas.push(newIdea);
-      io.emit("idea_added", newIdea);
+      pendingIdeas.push(newIdea);
     });
 
-    // Consensus Mediator Task: Quadratic Voting
-    socket.on("vote_idea", (data: { ideaId: string, tokens: number }) => {
+    // Consensus Mediator Task: Idea Voting
+    socket.on("update_idea_weight", (data: { ideaId: string, weightChange: number }) => {
       const idea = state.ideas.find(i => i.id === data.ideaId);
       if (idea) {
-        // Quadratic voting: cost = tokens^2, but we just add the raw tokens for simplicity in this demo
-        idea.weight += data.tokens;
-        io.emit("idea_updated", idea);
+        idea.weight = (idea.weight || 0) + data.weightChange;
+        // Prevent negative weights
+        if (idea.weight < 0) idea.weight = 0;
+        
+        const existingUpdateIndex = pendingUpdates.findIndex(u => u.id === data.ideaId);
+        if (existingUpdateIndex >= 0) {
+          pendingUpdates[existingUpdateIndex] = idea;
+        } else {
+          pendingUpdates.push(idea);
+        }
       }
     });
 
-    // Visual Scribe Task: Update Mermaid Diagram
-    socket.on("update_mermaid", (code: string) => {
-      state.mermaidCode = code;
-      io.emit("mermaid_updated", state.mermaidCode);
+    // Visual Scribe Task: Update React Flow Diagram
+    socket.on("update_flow", (data: { nodes: any[], edges: any[] }) => {
+      state.flowData = data;
+      io.emit("flow_updated", state.flowData);
     });
 
     // Phase transition

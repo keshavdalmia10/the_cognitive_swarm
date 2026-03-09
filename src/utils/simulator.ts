@@ -18,24 +18,34 @@ export function startSimulation(numClients = 5): () => void {
   const sockets: Socket[] = Array.from({ length: numClients }).map(() => io());
 
   let globalIdeas: any[] = [];
+  let globalTopic = '';
   let ideaIndex = 0;
 
   sockets.forEach((socket, i) => {
     socket.on('state_sync', (state) => {
       globalIdeas = state.ideas;
+      globalTopic = state.topic;
     });
 
-    socket.on('idea_added', (idea) => {
-      if (!globalIdeas.find(existing => existing.id === idea.id)) {
-        globalIdeas.push(idea);
-      }
+    socket.on('topic_updated', (topic) => {
+      globalTopic = topic;
     });
 
-    socket.on('idea_updated', (updatedIdea) => {
-      const index = globalIdeas.findIndex(idea => idea.id === updatedIdea.id);
-      if (index !== -1) {
-        globalIdeas[index] = updatedIdea;
-      }
+    socket.on('ideas_batch_added', (newIdeas: any[]) => {
+      newIdeas.forEach(idea => {
+        if (!globalIdeas.find(existing => existing.id === idea.id)) {
+          globalIdeas.push(idea);
+        }
+      });
+    });
+
+    socket.on('ideas_batch_updated', (updatedIdeas: any[]) => {
+      updatedIdeas.forEach(updatedIdea => {
+        const index = globalIdeas.findIndex(idea => idea.id === updatedIdea.id);
+        if (index !== -1) {
+          globalIdeas[index] = updatedIdea;
+        }
+      });
     });
 
     // Randomly add ideas from the erIdeas list
@@ -58,61 +68,12 @@ export function startSimulation(numClients = 5): () => void {
       // 40% chance every 1 second per client to vote
       if (globalIdeas.length > 0 && Math.random() > 0.6) {
         const randomIdea = globalIdeas[Math.floor(Math.random() * globalIdeas.length)];
-        socket.emit('vote_idea', { ideaId: randomIdea.id, tokens: 1 });
+        socket.emit('update_idea_weight', { ideaId: randomIdea.id, weightChange: 1 });
       }
     }, 1000);
 
-    let forgingInterval: NodeJS.Timeout | null = null;
-    
-    // Only let the first client simulate forging to avoid constant overwriting
-    if (i === 0) {
-      // Set initial problem statement in the diagram
-      setTimeout(() => {
-         socket.emit('update_mermaid', 'erDiagram\n  PROBLEM_STATEMENT {\n    string Topic "University Course Registration"\n    string Goal "Design optimal ER Schema"\n  }');
-      }, 1000);
-
-      forgingInterval = setInterval(() => {
-        if (globalIdeas.length > 0 && Math.random() > 0.3) {
-          // Get top ideas by weight
-          const topIdeas = [...globalIdeas]
-            .sort((a, b) => (b.weight || 0) - (a.weight || 0))
-            .slice(0, 10); // Take top 10
-            
-          let mermaid = "erDiagram\n";
-          
-          topIdeas.forEach(idea => {
-            if (idea.text.startsWith("Entity: ")) {
-              const match = idea.text.match(/Entity: (\w+) \((.*?)\)/);
-              if (match) {
-                const entityName = match[1];
-                const attributes = match[2].split(',').map((s: string) => s.trim());
-                mermaid += `  ${entityName} {\n`;
-                attributes.forEach((attr: string) => {
-                  mermaid += `    string ${attr.replace(/[^a-zA-Z0-9_]/g, '')}\n`;
-                });
-                mermaid += `  }\n`;
-              }
-            } else if (idea.text.startsWith("Relationship: ")) {
-              const match = idea.text.match(/Relationship: (\w+) (\w+) (\w+)/);
-              if (match) {
-                mermaid += `  ${match[1]} ||--o{ ${match[3]} : "${match[2]}"\n`;
-              }
-            }
-          });
-
-          // If no valid ER syntax was generated yet, keep the problem statement
-          if (mermaid === "erDiagram\n") {
-             mermaid = 'erDiagram\n  PROBLEM_STATEMENT {\n    string Topic "University Course Registration"\n    string Goal "Design optimal ER Schema"\n  }';
-          }
-
-          socket.emit('update_mermaid', mermaid);
-        }
-      }, 4000); // Every 4 seconds
-    }
-
     // Store intervals on the socket object for cleanup
     (socket as any).intervals = [ideaInterval, voteInterval];
-    if (forgingInterval) (socket as any).intervals.push(forgingInterval);
   });
 
   // Return a cleanup function to stop the simulation

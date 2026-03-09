@@ -4,9 +4,11 @@ import { GoogleGenAI, LiveServerMessage, Modality, Type } from '@google/genai';
 import { Mic, MicOff, BrainCircuit, Activity, Users, Zap, Bot } from 'lucide-react';
 import { motion } from 'motion/react';
 import IdeaSwarm from './components/IdeaSwarm';
-import MermaidDiagram from './components/MermaidDiagram';
-import QuadraticVoting from './components/QuadraticVoting';
+import IdeaVoting from './components/IdeaVoting';
 import { startSimulation } from './utils/simulator';
+import { ReactFlow, Background, Controls, MiniMap, Node, Edge } from '@xyflow/react';
+import '@xyflow/react/dist/style.css';
+import dagre from 'dagre';
 
 // Initialize Gemini Live API
 const ai = new GoogleGenAI({ apiKey: (import.meta as any).env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY || '' });
@@ -18,18 +20,19 @@ export default function App() {
   const [role, setRole] = useState<'admin' | 'participant' | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [phase, setPhase] = useState<'divergent' | 'convergent' | 'forging'>('divergent');
-  const [topic, setTopic] = useState<string>('Schema Design');
+  const [topic, setTopic] = useState<string>('');
   const [isEditingTopic, setIsEditingTopic] = useState(false);
   const [ideas, setIdeas] = useState<any[]>([]);
   const ideasRef = useRef<any[]>([]);
   useEffect(() => { ideasRef.current = ideas; }, [ideas]);
-  const [mermaidCode, setMermaidCode] = useState<string>('');
+  const [flowNodes, setFlowNodes] = useState<Node[]>([]);
+  const [flowEdges, setFlowEdges] = useState<Edge[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [isSimulating, setIsSimulating] = useState(false);
   const [session, setSession] = useState<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const stopSimulationRef = useRef<(() => void) | null>(null);
 
   // Connect to Socket.IO
@@ -38,26 +41,33 @@ export default function App() {
     setSocket(newSocket);
 
     newSocket.on('state_sync', (state) => {
-      setTopic(state.topic || 'Schema Design');
+      setTopic(state.topic || '');
       setPhase(state.phase);
       setIdeas(state.ideas);
-      setMermaidCode(state.mermaidCode);
+      if (state.flowData) {
+        setFlowNodes(state.flowData.nodes || []);
+        setFlowEdges(state.flowData.edges || []);
+      }
     });
 
     newSocket.on('topic_updated', (newTopic) => {
       setTopic(newTopic);
     });
 
-    newSocket.on('idea_added', (idea) => {
-      setIdeas((prev) => [...prev, idea]);
+    newSocket.on('ideas_batch_added', (newIdeas: any[]) => {
+      setIdeas((prev) => [...prev, ...newIdeas]);
     });
 
-    newSocket.on('idea_updated', (updatedIdea) => {
-      setIdeas((prev) => prev.map(i => i.id === updatedIdea.id ? updatedIdea : i));
+    newSocket.on('ideas_batch_updated', (updatedIdeas: any[]) => {
+      setIdeas((prev) => prev.map(i => {
+        const updated = updatedIdeas.find(u => u.id === i.id);
+        return updated ? updated : i;
+      }));
     });
 
-    newSocket.on('mermaid_updated', (code) => {
-      setMermaidCode(code);
+    newSocket.on('flow_updated', (data) => {
+      setFlowNodes(data.nodes || []);
+      setFlowEdges(data.edges || []);
     });
 
     newSocket.on('phase_changed', (newPhase) => {
@@ -80,6 +90,9 @@ export default function App() {
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach(t => t.stop());
       }
+      if (workletNodeRef.current) {
+        workletNodeRef.current.disconnect();
+      }
       if (audioContextRef.current) {
         audioContextRef.current.close();
       }
@@ -94,32 +107,71 @@ export default function App() {
       audioContextRef.current = audioContext;
 
       const source = audioContext.createMediaStreamSource(stream);
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
+      
+      const workletCode = `
+        const base64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+        function arrayBufferToBase64(buffer) {
+          const bytes = new Uint8Array(buffer);
+          let result = '';
+          const len = bytes.length;
+          for (let i = 0; i < len; i += 3) {
+            result += base64chars[bytes[i] >> 2];
+            result += base64chars[((bytes[i] & 3) << 4) | (bytes[i + 1] >> 4)];
+            result += base64chars[((bytes[i + 1] & 15) << 2) | (bytes[i + 2] >> 6)];
+            result += base64chars[bytes[i + 2] & 63];
+          }
+          if (len % 3 === 2) {
+            result = result.substring(0, result.length - 1) + '=';
+          } else if (len % 3 === 1) {
+            result = result.substring(0, result.length - 2) + '==';
+          }
+          return result;
+        }
 
-      source.connect(processor);
-      processor.connect(audioContext.destination);
+        class PCMProcessor extends AudioWorkletProcessor {
+          constructor() {
+            super();
+            this.bufferSize = 4096;
+            this.buffer = new Int16Array(this.bufferSize);
+            this.bytesWritten = 0;
+          }
+          process(inputs, outputs, parameters) {
+            const input = inputs[0];
+            if (input && input.length > 0) {
+              const channelData = input[0];
+              for (let i = 0; i < channelData.length; i++) {
+                this.buffer[this.bytesWritten++] = Math.max(-1, Math.min(1, channelData[i])) * 0x7FFF;
+                if (this.bytesWritten >= this.bufferSize) {
+                  const outBuffer = new Int16Array(this.buffer);
+                  const base64Data = arrayBufferToBase64(outBuffer.buffer);
+                  this.port.postMessage(base64Data);
+                  this.bytesWritten = 0;
+                }
+              }
+            }
+            return true;
+          }
+        }
+        registerProcessor('pcm-processor', PCMProcessor);
+      `;
+
+      const blob = new Blob([workletCode], { type: 'application/javascript' });
+      const workletUrl = URL.createObjectURL(blob);
+      await audioContext.audioWorklet.addModule(workletUrl);
+      
+      const workletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+      workletNodeRef.current = workletNode;
+
+      source.connect(workletNode);
+      workletNode.connect(audioContext.destination);
 
       const sessionPromise = ai.live.connect({
         model: "gemini-2.5-flash-native-audio-preview-09-2025",
         callbacks: {
           onopen: () => {
             console.log("Gemini Live Connected");
-            processor.onaudioprocess = (e) => {
-              const inputData = e.inputBuffer.getChannelData(0);
-              // Convert Float32Array to Int16Array (PCM16)
-              const pcm16 = new Int16Array(inputData.length);
-              for (let i = 0; i < inputData.length; i++) {
-                pcm16[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
-              }
-              // Convert to Base64
-              const buffer = new ArrayBuffer(pcm16.length * 2);
-              const view = new DataView(buffer);
-              for (let i = 0; i < pcm16.length; i++) {
-                view.setInt16(i * 2, pcm16[i], true); // true for little-endian
-              }
-              const base64Data = btoa(String.fromCharCode(...new Uint8Array(buffer)));
-
+            workletNode.port.onmessage = (e) => {
+              const base64Data = e.data;
               sessionPromise.then((s) =>
                 s.sendRealtimeInput({
                   media: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
@@ -172,8 +224,10 @@ export default function App() {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
           },
           systemInstruction: `You are the Supervisor of 'The Cognitive Swarm', a real-time brainstorming tool.
+          The current brainstorming topic is: "${topic}".
           Listen to the user's audio input.
-          If they state an idea, use the 'extractIdea' tool to capture it.
+          If they state an idea that is RELEVANT to the current topic, use the 'extractIdea' tool to capture it.
+          If they state something completely irrelevant to the topic, DO NOT extract it.
           If they ask to summarize or create a diagram, FIRST use the 'getIdeas' tool to retrieve the current list of ideas, THEN use the 'generateMermaid' tool to create a flowchart or ER diagram based on those ideas.
           Keep your verbal responses extremely concise.`,
           tools: [{
@@ -241,25 +295,113 @@ export default function App() {
     try {
       setForgeError(null);
       setIsForging(true);
-      const ai = new GoogleGenAI({ apiKey: (import.meta as any).env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY || '' });
       
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: JSON.stringify(ideasRef.current),
-        config: {
-          systemInstruction: 'You are the Visual Scribe for a brainstorming session. Based on the current ideas and their weights, generate a Mermaid.js ER diagram. Return ONLY the raw Mermaid code, without any markdown formatting like ```mermaid or ```.',
-        }
-      });
+      const currentIdeas = ideasRef.current;
+      
+      const safeTopic = (topic || 'Brainstorming Session').replace(/["{}()\[\]]/g, '');
 
-      let code = response.text || '';
-      code = code.trim();
-      if (code.startsWith('```mermaid')) {
-        code = code.replace(/^```mermaid\n/, '').replace(/\n```$/, '');
-      } else if (code.startsWith('```')) {
-        code = code.replace(/^```\n/, '').replace(/\n```$/, '');
+      if (currentIdeas.length === 0) {
+        const emptyNodes: Node[] = [
+          { id: 'root', position: { x: 0, y: 0 }, data: { label: safeTopic }, style: { background: '#00FF00', color: '#000', fontWeight: 'bold', padding: '10px', borderRadius: '8px' } },
+          { id: 'empty', position: { x: 0, y: 100 }, data: { label: 'No ideas generated yet' }, style: { background: '#111', color: '#fff', border: '1px solid #333', padding: '10px', borderRadius: '8px' } }
+        ];
+        const emptyEdges: Edge[] = [
+          { id: 'e-root-empty', source: 'root', target: 'empty', animated: true, style: { stroke: '#00FF00' } }
+        ];
+        socket?.emit('update_flow', { nodes: emptyNodes, edges: emptyEdges });
+        return;
       }
 
-      socket?.emit('update_mermaid', code);
+      // 1. Sort by weight (highest first) and take top 30
+      const topIdeas = [...currentIdeas].sort((a, b) => (b.weight || 0) - (a.weight || 0)).slice(0, 30);
+      
+      // 2. Group by cluster
+      const clusters = new Map<string, typeof currentIdeas>();
+      topIdeas.forEach(idea => {
+        const c = idea.cluster || 'General';
+        if (!clusters.has(c)) clusters.set(c, []);
+        clusters.get(c)!.push(idea);
+      });
+
+      // 3. Generate React Flow Nodes & Edges
+      const newNodes: Node[] = [];
+      const newEdges: Edge[] = [];
+
+      const dagreGraph = new dagre.graphlib.Graph();
+      dagreGraph.setDefaultEdgeLabel(() => ({}));
+      dagreGraph.setGraph({ rankdir: 'TB', ranksep: 100, nodesep: 50 });
+
+      // Root Node
+      newNodes.push({
+        id: 'root',
+        data: { label: safeTopic },
+        position: { x: 0, y: 0 },
+        style: { background: '#00FF00', color: '#000', fontWeight: 'bold', padding: '15px', borderRadius: '10px', fontSize: '18px', border: '2px solid #000' }
+      });
+      dagreGraph.setNode('root', { width: 250, height: 60 });
+
+      let clusterIndex = 0;
+      for (const [clusterName, clusterIdeas] of clusters.entries()) {
+        const cId = `C${clusterIndex}`;
+        const safeClusterName = clusterName.replace(/["{}()\[\]]/g, '');
+        
+        newNodes.push({
+          id: cId,
+          data: { label: safeClusterName },
+          position: { x: 0, y: 0 },
+          style: { background: '#111', color: '#00FF00', fontWeight: 'bold', padding: '10px', borderRadius: '8px', border: '2px dashed #00FF00' }
+        });
+        dagreGraph.setNode(cId, { width: 200, height: 50 });
+        
+        newEdges.push({
+          id: `e-root-${cId}`,
+          source: 'root',
+          target: cId,
+          animated: true,
+          style: { stroke: '#00FF00', strokeWidth: 2 }
+        });
+        dagreGraph.setEdge('root', cId);
+        
+        clusterIdeas.forEach((idea, i) => {
+          const iId = `I${clusterIndex}_${i}`;
+          const safeText = idea.text.replace(/["{}()\[\]]/g, '').replace(/\n/g, ' ').substring(0, 60) + (idea.text.length > 60 ? '...' : '');
+          
+          const weight = idea.weight || 1;
+          const r = Math.min(255, 26 + (weight * 10));
+          const g = Math.min(255, 54 + (weight * 15));
+          const b = Math.min(255, 93 + (weight * 20));
+          
+          newNodes.push({
+            id: iId,
+            data: { label: safeText },
+            position: { x: 0, y: 0 },
+            style: { background: `rgb(${r},${g},${b})`, color: '#fff', padding: '10px', borderRadius: '8px', border: `2px solid #63b3ed`, width: 250 }
+          });
+          dagreGraph.setNode(iId, { width: 250, height: 60 });
+          
+          newEdges.push({
+            id: `e-${cId}-${iId}`,
+            source: cId,
+            target: iId,
+            style: { stroke: '#63b3ed', strokeWidth: Math.min(4, 1 + weight * 0.5) }
+          });
+          dagreGraph.setEdge(cId, iId);
+        });
+        clusterIndex++;
+      }
+
+      // Apply dagre layout
+      dagre.layout(dagreGraph);
+      
+      newNodes.forEach((node) => {
+        const nodeWithPosition = dagreGraph.node(node.id);
+        node.position = {
+          x: nodeWithPosition.x - nodeWithPosition.width / 2,
+          y: nodeWithPosition.y - nodeWithPosition.height / 2,
+        };
+      });
+
+      socket?.emit('update_flow', { nodes: newNodes, edges: newEdges });
     } catch (error: any) {
       console.error("Manual forge failed:", error);
       setForgeError(error.message || "Failed to generate diagram. Please try again.");
@@ -280,22 +422,37 @@ export default function App() {
             Select your role to join the session.
           </p>
           
-          <div className="mb-6 text-left">
-            <label className="block text-xs font-mono text-white/50 mb-2 uppercase tracking-wider">Display Name</label>
-            <input 
-              type="text" 
-              value={userName}
-              onChange={(e) => setUserName(e.target.value)}
-              placeholder="Enter your name..."
-              className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-[#00FF00]/50 transition-colors"
-            />
+          <div className="mb-6 text-left space-y-4">
+            <div>
+              <label className="block text-xs font-mono text-white/50 mb-2 uppercase tracking-wider">Brainstorming Topic</label>
+              <input 
+                type="text" 
+                value={topic}
+                onChange={(e) => setTopic(e.target.value)}
+                placeholder="Enter topic..."
+                className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-[#00FF00]/50 transition-colors"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-mono text-white/50 mb-2 uppercase tracking-wider">Display Name</label>
+              <input 
+                type="text" 
+                value={userName}
+                onChange={(e) => setUserName(e.target.value)}
+                placeholder="Enter your name..."
+                className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-[#00FF00]/50 transition-colors"
+              />
+            </div>
           </div>
 
           <div className="space-y-4">
             <button
-              onClick={() => setRole('admin')}
-              disabled={!userName.trim()}
-              className={`w-full py-4 px-6 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-all flex items-center justify-between group ${!userName.trim() ? 'opacity-50 cursor-not-allowed' : ''}`}
+              onClick={() => {
+                setRole('admin');
+                socket?.emit('set_topic', topic);
+              }}
+              disabled={!userName.trim() || !topic.trim()}
+              className={`w-full py-4 px-6 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-all flex items-center justify-between group ${(!userName.trim() || !topic.trim()) ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-full bg-[#00FF00]/20 flex items-center justify-center group-hover:bg-[#00FF00]/30 transition-colors">
@@ -309,9 +466,12 @@ export default function App() {
             </button>
 
             <button
-              onClick={() => setRole('participant')}
-              disabled={!userName.trim()}
-              className={`w-full py-4 px-6 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-all flex items-center justify-between group ${!userName.trim() ? 'opacity-50 cursor-not-allowed' : ''}`}
+              onClick={() => {
+                setRole('participant');
+                socket?.emit('set_topic', topic);
+              }}
+              disabled={!userName.trim() || !topic.trim()}
+              className={`w-full py-4 px-6 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-all flex items-center justify-between group ${(!userName.trim() || !topic.trim()) ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-full bg-blue-500/20 flex items-center justify-center group-hover:bg-blue-500/30 transition-colors">
@@ -347,11 +507,13 @@ export default function App() {
                     value={topic}
                     onChange={(e) => setTopic(e.target.value)}
                     onBlur={() => {
-                      setIsEditingTopic(false);
-                      socket?.emit('set_topic', topic);
+                      if (topic.trim()) {
+                        setIsEditingTopic(false);
+                        socket?.emit('set_topic', topic);
+                      }
                     }}
                     onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
+                      if (e.key === 'Enter' && topic.trim()) {
                         setIsEditingTopic(false);
                         socket?.emit('set_topic', topic);
                       }
@@ -439,7 +601,7 @@ export default function App() {
           
           {phase === 'convergent' && (
             <div className="absolute inset-0 p-8 overflow-y-auto">
-              <QuadraticVoting ideas={ideas} socket={socket} />
+              <IdeaVoting ideas={ideas} socket={socket} />
             </div>
           )}
 
@@ -535,15 +697,33 @@ export default function App() {
           )}
         </div>
 
-        {/* Right Panel: Artifacts (Mermaid) & Leaderboard */}
+        {/* Right Panel: Artifacts (React Flow) & Leaderboard */}
         <div className="w-[400px] bg-[#0a0a0a] flex flex-col border-l border-white/10">
           <div className="flex-1 flex flex-col min-h-0">
             <div className="p-4 border-b border-white/10 flex items-center gap-2">
               <Users className="w-4 h-4 text-[#00FF00]" />
               <span className="font-mono text-xs uppercase tracking-wider text-white/70">Live Artifact</span>
             </div>
-            <div className="flex-1 p-4 overflow-auto">
-              <MermaidDiagram code={mermaidCode} />
+            <div className="flex-1 overflow-hidden relative">
+              {flowNodes.length > 0 ? (
+                <ReactFlow
+                  nodes={flowNodes}
+                  edges={flowEdges}
+                  fitView
+                  className="bg-[#050505]"
+                  minZoom={0.1}
+                  maxZoom={4}
+                  colorMode="dark"
+                >
+                  <Background color="#333" gap={16} />
+                  <Controls style={{ backgroundColor: '#111', fill: '#fff' }} />
+                  <MiniMap nodeColor="#00FF00" maskColor="rgba(0, 0, 0, 0.8)" style={{ backgroundColor: '#111' }} />
+                </ReactFlow>
+              ) : (
+                <div className="absolute inset-0 flex items-center justify-center text-white/30 font-mono text-sm p-8 text-center">
+                  Waiting for Administrator to forge the diagram...
+                </div>
+              )}
             </div>
           </div>
           

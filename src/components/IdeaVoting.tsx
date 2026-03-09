@@ -3,7 +3,7 @@ import { motion } from 'motion/react';
 import { Socket } from 'socket.io-client';
 import { Check, Plus, Minus, ShieldAlert } from 'lucide-react';
 
-export default function QuadraticVoting({ ideas, socket }: { ideas: any[], socket: Socket | null }) {
+export default function IdeaVoting({ ideas, socket }: { ideas: any[], socket: Socket | null }) {
   const [tokens, setTokens] = useState(100);
   const [votes, setVotes] = useState<Record<string, number>>({});
 
@@ -18,7 +18,7 @@ export default function QuadraticVoting({ ideas, socket }: { ideas: any[], socke
     if (tokens - costDiff >= 0) {
       setTokens(prev => prev - costDiff);
       setVotes(prev => ({ ...prev, [ideaId]: newVotes }));
-      socket?.emit('vote_idea', { ideaId, tokens: delta });
+      socket?.emit('update_idea_weight', { ideaId, weightChange: delta });
     }
   };
 

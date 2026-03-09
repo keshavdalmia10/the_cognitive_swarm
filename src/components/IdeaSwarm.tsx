@@ -50,16 +50,46 @@ function IdeaNode({ idea, position }: { idea: any, position: [number, number, nu
 }
 
 export default function IdeaSwarm({ ideas }: { ideas: any[] }) {
-  // Generate random positions for ideas
+  // Generate positions for ideas grouped by cluster
   const positions = useMemo(() => {
-    return ideas.map((_, i) => {
-      const radius = 5 + Math.random() * 5;
-      const theta = Math.random() * Math.PI * 2;
-      const phi = Math.acos(Math.random() * 2 - 1);
-      return [
+    // Group ideas by cluster
+    const clusters: Record<string, any[]> = {};
+    ideas.forEach(idea => {
+      if (!clusters[idea.cluster]) clusters[idea.cluster] = [];
+      clusters[idea.cluster].push(idea);
+    });
+
+    const clusterNames = Object.keys(clusters);
+    const numClusters = clusterNames.length;
+    
+    // Assign a base position for each cluster on a large sphere
+    const clusterCenters: Record<string, [number, number, number]> = {};
+    clusterNames.forEach((name, i) => {
+      // Distribute cluster centers evenly using spherical Fibonacci or simple ring
+      const phi = Math.acos(1 - 2 * (i + 0.5) / Math.max(1, numClusters));
+      const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+      const radius = 12; // Distance of cluster centers from origin
+      
+      clusterCenters[name] = [
         radius * Math.sin(phi) * Math.cos(theta),
         radius * Math.sin(phi) * Math.sin(theta),
         radius * Math.cos(phi)
+      ];
+    });
+
+    // Assign individual idea positions around their cluster center
+    return ideas.map((idea) => {
+      const center = clusterCenters[idea.cluster] || [0, 0, 0];
+      
+      // Small random offset around the cluster center
+      const offsetRadius = 2 + Math.random() * 3;
+      const offsetTheta = Math.random() * Math.PI * 2;
+      const offsetPhi = Math.acos(Math.random() * 2 - 1);
+      
+      return [
+        center[0] + offsetRadius * Math.sin(offsetPhi) * Math.cos(offsetTheta),
+        center[1] + offsetRadius * Math.sin(offsetPhi) * Math.sin(offsetTheta),
+        center[2] + offsetRadius * Math.cos(offsetPhi)
       ] as [number, number, number];
     });
   }, [ideas]);
