@@ -2,6 +2,9 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import { Server } from "socket.io";
 import http from "http";
+import { GoogleGenAI, Type, LiveServerMessage } from "@google/genai";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Generate a fixed random projection matrix (3 x 768) to map embeddings to 3D space
 const projectionMatrix = Array.from({ length: 3 }, () =>
@@ -65,6 +68,159 @@ async function startServer() {
     // Send initial state
     socket.emit("state_sync", state);
 
+    let liveSessionPromise: Promise<any> | null = null;
+
+    socket.on("start_audio_session", (data: { topic: string, userName: string }) => {
+      liveSessionPromise = ai.live.connect({
+        model: "gemini-2.5-flash-native-audio-preview-09-2025",
+        callbacks: {
+          onopen: () => {
+            console.log("Gemini Live Connected for", socket.id);
+            socket.emit("audio_session_started");
+          },
+          onmessage: async (message: LiveServerMessage) => {
+            // Forward audio to client
+            const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+            if (base64Audio) {
+              socket.emit("audio_response", base64Audio);
+            }
+
+            // Handle tool calls
+            if (message.toolCall) {
+              const calls = message.toolCall.functionCalls;
+              if (calls) {
+                const functionResponses: any[] = [];
+                for (const call of calls) {
+                  if (call.name === 'extractIdea') {
+                    const args = call.args as any;
+                    const ideaId = Math.random().toString(36).substring(2, 9);
+                    const newIdea = {
+                      id: ideaId,
+                      text: args.idea,
+                      weight: 1,
+                      cluster: args.category || 'General',
+                      authorId: socket.id,
+                      authorName: data.userName || 'Anonymous Node',
+                      initialPosition: [(Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20],
+                      targetPosition: null as any
+                    };
+                    state.ideas.push(newIdea);
+                    pendingIdeas.push(newIdea);
+
+                    // Fetch embedding asynchronously
+                    ai.models.embedContent({
+                      model: 'text-embedding-004',
+                      contents: args.idea,
+                    }).then(response => {
+                      const embedding = response.embeddings?.[0]?.values;
+                      if (embedding) {
+                        const targetPosition = projectTo3D(embedding);
+                        newIdea.targetPosition = targetPosition;
+                        io.emit('idea_positioned', { id: ideaId, targetPosition });
+                      }
+                    }).catch(err => console.error("Embedding error:", err));
+
+                    functionResponses.push({
+                      id: call.id,
+                      name: call.name,
+                      response: { result: "Idea extracted successfully" }
+                    });
+                  } else if (call.name === 'generateMermaid') {
+                    const args = call.args as any;
+                    io.emit('update_mermaid', args.code);
+                    functionResponses.push({
+                      id: call.id,
+                      name: call.name,
+                      response: { result: "Mermaid diagram generated successfully" }
+                    });
+                  } else if (call.name === 'getIdeas') {
+                    const ideasList = state.ideas.map(i => ({ text: i.text, cluster: i.cluster, weight: i.weight }));
+                    functionResponses.push({
+                      id: call.id,
+                      name: call.name,
+                      response: { ideas: ideasList }
+                    });
+                  }
+                }
+
+                if (liveSessionPromise) {
+                  liveSessionPromise.then(s => s.sendToolResponse({ functionResponses }));
+                }
+              }
+            }
+          },
+          onclose: () => {
+            console.log("Gemini Live Disconnected for", socket.id);
+            socket.emit("audio_session_closed");
+          }
+        },
+        config: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } }
+          },
+          systemInstruction: `You are the Supervisor of 'The Cognitive Swarm', a real-time brainstorming tool.
+          The current brainstorming topic is: "${data.topic}".
+          You are talking to: ${data.userName}.
+          Your job is to listen to the user, extract concise ideas, and use the 'extractIdea' tool to add them to the swarm.
+          Keep your verbal responses extremely short, encouraging, and robotic/AI-like (e.g., "Idea logged.", "Processing.", "Good thought.").
+          If they ask to summarize or create a diagram, FIRST use the 'getIdeas' tool to retrieve the current list of ideas, THEN use the 'generateMermaid' tool to create a flowchart or ER diagram based on those ideas.
+          Only use 'generateMermaid' when explicitly asked to summarize, forge, or diagram the ideas.`,
+          tools: [{
+            functionDeclarations: [
+              {
+                name: 'extractIdea',
+                description: 'Extracts a brainstorming idea from the user audio.',
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: {
+                    idea: { type: Type.STRING, description: 'A concise, 3-7 word summary of the idea.' },
+                    category: { type: Type.STRING, description: 'A 1-2 word category or cluster name.' }
+                  },
+                  required: ['idea', 'category']
+                }
+              },
+              {
+                name: 'generateMermaid',
+                description: 'Generates a Mermaid.js diagram based on the current ideas.',
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: {
+                    code: { type: Type.STRING, description: 'The raw Mermaid.js code (e.g., graph TD; A-->B;)' }
+                  },
+                  required: ['code']
+                }
+              },
+              {
+                name: 'getIdeas',
+                description: 'Gets the current list of brainstormed ideas and their weights.',
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: {
+                    format: { type: Type.STRING, description: 'The format to return (e.g., "json")' }
+                  }
+                }
+              }
+            ]
+          }]
+        }
+      });
+    });
+
+    socket.on("audio_chunk", (base64Data: string) => {
+      if (liveSessionPromise) {
+        liveSessionPromise.then(s => {
+          s.sendRealtimeInput({
+            media: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
+          });
+        }).catch(err => console.error("Error sending audio chunk:", err));
+      }
+    });
+
+    socket.on("stop_audio_session", () => {
+      liveSessionPromise = null;
+    });
+
     // Update topic
     socket.on("set_topic", (topic: string) => {
       state.topic = topic;
@@ -122,16 +278,24 @@ async function startServer() {
     });
 
     // Edit Idea Task
-    socket.on("edit_idea", (data: { id: string, text: string, cluster: string, embedding?: number[] }) => {
+    socket.on("edit_idea", (data: { id: string, text: string, cluster: string, textChanged?: boolean }) => {
       const idea = state.ideas.find(i => i.id === data.id);
       if (idea) {
         idea.text = data.text;
         idea.cluster = data.cluster;
         
-        if (data.embedding) {
-          const targetPosition = projectTo3D(data.embedding);
-          idea.targetPosition = targetPosition;
-          io.emit('idea_positioned', { id: idea.id, targetPosition });
+        if (data.textChanged) {
+          ai.models.embedContent({
+            model: 'text-embedding-004',
+            contents: data.text,
+          }).then(response => {
+            const embedding = response.embeddings?.[0]?.values;
+            if (embedding) {
+              const targetPosition = projectTo3D(embedding);
+              idea.targetPosition = targetPosition;
+              io.emit('idea_positioned', { id: idea.id, targetPosition });
+            }
+          }).catch(err => console.error("Embedding error:", err));
         }
         
         const existingUpdateIndex = pendingUpdates.findIndex(u => u.id === data.id);

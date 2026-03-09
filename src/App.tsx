@@ -1,6 +1,5 @@
 import { useEffect, useState, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { GoogleGenAI, LiveServerMessage, Modality, Type } from '@google/genai';
 import { Mic, MicOff, BrainCircuit, Activity, Users, Zap, Bot } from 'lucide-react';
 import { motion } from 'motion/react';
 import IdeaSwarm from './components/IdeaSwarm';
@@ -9,9 +8,6 @@ import { startSimulation } from './utils/simulator';
 import { ReactFlow, Background, Controls, MiniMap, Node, Edge } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import dagre from 'dagre';
-
-// Initialize Gemini Live API
-const ai = new GoogleGenAI({ apiKey: (import.meta as any).env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY || '' });
 
 export default function App() {
   const [userName, setUserName] = useState('');
@@ -29,7 +25,6 @@ export default function App() {
   const [flowEdges, setFlowEdges] = useState<Edge[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [isSimulating, setIsSimulating] = useState(false);
-  const [session, setSession] = useState<any>(null);
   const [selectedIdeaId, setSelectedIdeaId] = useState<string | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -40,20 +35,9 @@ export default function App() {
     if (socket) {
       const idea = ideas.find(i => i.id === id);
       if (idea && idea.text !== text) {
-        // Text changed, recalculate embedding
-        socket.emit('edit_idea', { id, text, cluster });
-        ai.models.embedContent({
-          model: 'text-embedding-004',
-          contents: text,
-        }).then(response => {
-          const embedding = response.embeddings?.[0]?.values;
-          if (embedding) {
-            socket.emit('update_idea_embedding', { id, embedding });
-          }
-        }).catch(err => console.error("Embedding error:", err));
+        socket.emit('edit_idea', { id, text, cluster, textChanged: true });
       } else {
-        // Only cluster changed
-        socket.emit('edit_idea', { id, text, cluster });
+        socket.emit('edit_idea', { id, text, cluster, textChanged: false });
       }
     }
   };
@@ -112,10 +96,7 @@ export default function App() {
   const toggleRecording = async () => {
     if (isRecording) {
       // Stop recording
-      if (session) {
-        session.close();
-        setSession(null);
-      }
+      socket?.emit('stop_audio_session');
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach(t => t.stop());
       }
@@ -194,128 +175,13 @@ export default function App() {
       source.connect(workletNode);
       workletNode.connect(audioContext.destination);
 
-      const sessionPromise = ai.live.connect({
-        model: "gemini-2.5-flash-native-audio-preview-09-2025",
-        callbacks: {
-          onopen: () => {
-            console.log("Gemini Live Connected");
-            workletNode.port.onmessage = (e) => {
-              const base64Data = e.data;
-              sessionPromise.then((s) =>
-                s.sendRealtimeInput({
-                  media: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
-                })
-              );
-            };
-          },
-          onmessage: async (message: LiveServerMessage) => {
-            // Handle tool calls from Gemini
-            if (message.toolCall) {
-              const calls = message.toolCall.functionCalls;
-              if (calls) {
-                const functionResponses: any[] = [];
-                for (const call of calls) {
-                  if (call.name === 'extractIdea') {
-                    const args = call.args as any;
-                    const ideaId = Math.random().toString(36).substring(2, 9);
-                    const ideaText = args.idea;
-                    const cluster = args.category;
-                    const authorName = userNameRef.current || 'Anonymous Node';
+      socket?.emit('start_audio_session', { topic, userName: userNameRef.current });
 
-                    // Emit immediately for instant fake placement
-                    socket?.emit('add_idea', { id: ideaId, text: ideaText, cluster, authorName });
+      workletNode.port.onmessage = (e) => {
+        const base64Data = e.data;
+        socket?.emit('audio_chunk', base64Data);
+      };
 
-                    // Then calculate embedding and update
-                    ai.models.embedContent({
-                      model: 'text-embedding-004',
-                      contents: ideaText,
-                    }).then(response => {
-                      const embedding = response.embeddings?.[0]?.values;
-                      if (embedding) {
-                        socket?.emit('update_idea_embedding', { id: ideaId, embedding });
-                      }
-                    }).catch(err => console.error("Embedding error:", err));
-
-                    functionResponses.push({
-                      id: call.id,
-                      name: call.name,
-                      response: { result: "Idea extracted successfully" }
-                    });
-                  } else if (call.name === 'generateMermaid') {
-                    const args = call.args as any;
-                    socket?.emit('update_mermaid', args.code);
-                    functionResponses.push({
-                      id: call.id,
-                      name: call.name,
-                      response: { result: "Mermaid diagram generated successfully" }
-                    });
-                  } else if (call.name === 'getIdeas') {
-                    functionResponses.push({
-                      id: call.id,
-                      name: call.name,
-                      response: { ideas: ideasRef.current }
-                    });
-                  }
-                }
-                sessionPromise.then(s => s.sendToolResponse({ functionResponses }));
-              }
-            }
-            // Handle audio output if needed (omitted for simplicity, we focus on text/tools)
-          },
-          onerror: (err) => console.error("Gemini Error:", err),
-          onclose: () => console.log("Gemini Closed"),
-        },
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
-          },
-          systemInstruction: `You are the Supervisor of 'The Cognitive Swarm', a real-time brainstorming tool.
-          The current brainstorming topic is: "${topic}".
-          Listen to the user's audio input.
-          If they state an idea that is RELEVANT to the current topic, use the 'extractIdea' tool to capture it.
-          If they state something completely irrelevant to the topic, DO NOT extract it.
-          If they ask to summarize or create a diagram, FIRST use the 'getIdeas' tool to retrieve the current list of ideas, THEN use the 'generateMermaid' tool to create a flowchart or ER diagram based on those ideas.
-          Keep your verbal responses extremely concise.`,
-          tools: [{
-            functionDeclarations: [
-              {
-                name: 'extractIdea',
-                description: 'Extracts a brainstorming idea from the user audio.',
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {
-                    idea: { type: Type.STRING, description: 'The core idea or concept.' },
-                    category: { type: Type.STRING, description: 'A 1-2 word category or cluster for this idea.' }
-                  },
-                  required: ['idea', 'category']
-                }
-              },
-              {
-                name: 'generateMermaid',
-                description: 'Generates a Mermaid.js diagram based on the current ideas.',
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {
-                    code: { type: Type.STRING, description: 'The raw Mermaid.js code (e.g., graph TD; A-->B;)' }
-                  },
-                  required: ['code']
-                }
-              },
-              {
-                name: 'getIdeas',
-                description: 'Gets the current list of brainstormed ideas and their weights.',
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {}
-                }
-              }
-            ]
-          }]
-        },
-      });
-
-      sessionPromise.then(s => setSession(s));
       setIsRecording(true);
     } catch (err) {
       console.error("Failed to start recording:", err);
