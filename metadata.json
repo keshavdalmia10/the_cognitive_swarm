@@ -1,5 +1,5 @@
 {
   "name": "The Cognitive Swarm",
   "description": "A real-time, multimodal crowd brainstorming system using Gemini Live API.",
-  "requestFramePermissions": ["microphone"]
+  "requestFramePermissions": ["microphone", "camera"]
 }

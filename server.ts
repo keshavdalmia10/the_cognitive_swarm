@@ -1,15 +1,22 @@
+import "dotenv/config";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { Server } from "socket.io";
 import http from "http";
-import { GoogleGenAI, Type, LiveServerMessage } from "@google/genai";
+import { GoogleGenAI, Type, LiveServerMessage, Modality } from "@google/genai";
+import fs from "fs";
+
+function logToFile(msg: string) {
+  fs.appendFileSync("server_debug.log", new Date().toISOString() + ": " + msg + "\n");
+}
 
 function getAI() {
-  const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    console.warn("No API key found in environment variables.");
+    console.warn("No API key found in environment variables. Initializing without explicit key.");
+    return new GoogleGenAI({});
   }
-  return new GoogleGenAI({ apiKey: apiKey || '' });
+  return new GoogleGenAI({ apiKey });
 }
 
 // Generate a fixed random projection matrix (3 x 768) to map embeddings to 3D space
@@ -224,16 +231,25 @@ async function startServer() {
     socket.emit("state_sync", state);
 
     let liveSessionPromise: Promise<any> | null = null;
+    let audioActive = false;
+    let videoActive = false;
 
-    socket.on("start_audio_session", (data: { topic: string, userName: string }) => {
+    const startSessionIfNeeded = (topic: string, userName: string) => {
+      if (liveSessionPromise) return;
+      
       liveSessionPromise = getAI().live.connect({
         model: "gemini-2.5-flash-native-audio-preview-09-2025",
         callbacks: {
           onopen: () => {
             console.log("Gemini Live Connected for", socket.id);
+            logToFile("Gemini Live Connected for " + socket.id);
             socket.emit("audio_session_started");
           },
           onmessage: async (message: LiveServerMessage) => {
+            // console.log("Received message from Gemini:", Object.keys(message));
+            if (message.serverContent?.modelTurn) {
+              logToFile("Received modelTurn: " + JSON.stringify(message.serverContent.modelTurn).substring(0, 200));
+            }
             // Forward audio to client
             const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (base64Audio) {
@@ -242,10 +258,12 @@ async function startServer() {
 
             // Handle tool calls
             if (message.toolCall) {
+              logToFile("Received toolCall: " + JSON.stringify(message.toolCall));
               const calls = message.toolCall.functionCalls;
               if (calls) {
                 const functionResponses: any[] = [];
                 for (const call of calls) {
+                  logToFile("Processing function call: " + call.name + " " + JSON.stringify(call.args));
                   if (call.name === 'extractIdea') {
                     const args = call.args as any;
                     const ideaId = Math.random().toString(36).substring(2, 9);
@@ -255,7 +273,7 @@ async function startServer() {
                       weight: 1,
                       cluster: args.category || 'General',
                       authorId: socket.id,
-                      authorName: data.userName || 'Anonymous Node',
+                      authorName: userName || 'Anonymous Node',
                       initialPosition: [(Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20],
                       targetPosition: null as any
                     };
@@ -301,28 +319,36 @@ async function startServer() {
                 }
 
                 if (liveSessionPromise) {
-                  liveSessionPromise.then(s => s.sendToolResponse({ functionResponses }));
+                  liveSessionPromise.then(s => s.sendToolResponse({ functionResponses })).catch(err => console.error("Error sending tool response:", err));
                 }
               }
             }
           },
           onclose: () => {
             console.log("Gemini Live Disconnected for", socket.id);
+            logToFile("Gemini Live Disconnected for " + socket.id);
             socket.emit("audio_session_closed");
+          },
+          onerror: (err) => {
+            console.error("Gemini Live Error for", socket.id, err);
+            logToFile("Gemini Live Error for " + socket.id + ": " + (err instanceof Error ? err.message : JSON.stringify(err)));
           }
         },
         config: {
-          responseModalities: ["AUDIO"],
+          responseModalities: [Modality.AUDIO],
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } }
           },
-          systemInstruction: `You are the Supervisor of 'The Cognitive Swarm', a real-time brainstorming tool.
-          The current brainstorming topic is: "${data.topic}".
-          You are talking to: ${data.userName}.
+          systemInstruction: `You are the Supervisor of 'The Cognitive Swarm', a real-time multimodal brainstorming tool.
+          The current brainstorming topic is: "${topic}".
+          You are talking to: ${userName}.
+          You can see the user's camera feed and hear their voice.
           Your job is to listen to the user, extract concise ideas, and use the 'extractIdea' tool to add them to the swarm.
           Keep your verbal responses extremely short, encouraging, and robotic/AI-like (e.g., "Idea logged.", "Processing.", "Good thought.").
           If they ask to summarize or create a diagram, FIRST use the 'getIdeas' tool to retrieve the current list of ideas, THEN use the 'generateMermaid' tool to create a flowchart or ER diagram based on those ideas.
-          Only use 'generateMermaid' when explicitly asked to summarize, forge, or diagram the ideas.`,
+          Only use 'generateMermaid' when explicitly asked to summarize, forge, or diagram the ideas.
+          IMPORTANT: You MUST use the 'extractIdea' tool whenever the user shares a new idea. Do not just acknowledge it verbally.
+          CRITICAL INSTRUCTION: If the user says anything that sounds like an idea, a suggestion, or a thought related to the topic, you MUST call the 'extractIdea' tool immediately.`,
           tools: [{
             functionDeclarations: [
               {
@@ -362,6 +388,41 @@ async function startServer() {
           }]
         }
       });
+      
+      liveSessionPromise.catch(err => {
+        console.error("Live session connect error:", err);
+        logToFile("Live session connect error: " + err.message);
+        liveSessionPromise = null;
+      });
+    };
+
+    const stopSessionIfNeeded = () => {
+      if (!audioActive && !videoActive && liveSessionPromise) {
+        liveSessionPromise.then(s => s.close()).catch(err => console.error(err));
+        liveSessionPromise = null;
+      }
+    };
+
+    socket.on("start_audio_session", (data: { topic: string, userName: string }) => {
+      logToFile("start_audio_session received for " + socket.id);
+      audioActive = true;
+      startSessionIfNeeded(data.topic, data.userName);
+    });
+
+    socket.on("stop_audio_session", () => {
+      logToFile("stop_audio_session received for " + socket.id);
+      audioActive = false;
+      stopSessionIfNeeded();
+    });
+
+    socket.on("start_video_session", (data: { topic: string, userName: string }) => {
+      videoActive = true;
+      startSessionIfNeeded(data.topic, data.userName);
+    });
+
+    socket.on("stop_video_session", () => {
+      videoActive = false;
+      stopSessionIfNeeded();
     });
 
     socket.on("audio_chunk", (base64Data: string) => {
@@ -370,12 +431,24 @@ async function startServer() {
           s.sendRealtimeInput({
             media: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
           });
-        }).catch(err => console.error("Error sending audio chunk:", err));
+        }).catch(err => {
+          console.error("Error sending audio chunk:", err);
+          logToFile("Error sending audio chunk: " + err.message);
+        });
       }
     });
 
-    socket.on("stop_audio_session", () => {
-      liveSessionPromise = null;
+    socket.on("video_chunk", (base64Data: string) => {
+      if (liveSessionPromise) {
+        liveSessionPromise.then(s => {
+          s.sendRealtimeInput({
+            media: { data: base64Data, mimeType: 'image/jpeg' }
+          });
+        }).catch(err => {
+          console.error("Error sending video chunk:", err);
+          logToFile("Error sending video chunk: " + err.message);
+        });
+      }
     });
 
     // Update topic
@@ -433,6 +506,8 @@ async function startServer() {
         } else {
           pendingUpdates.push(idea);
         }
+        
+        io.emit('idea_weight_updated', { ideaId: data.ideaId, weight: idea.weight });
       }
     });
 

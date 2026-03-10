@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Mic, MicOff, BrainCircuit, Activity, Users, Zap, Bot } from 'lucide-react';
+import { Mic, MicOff, Camera, CameraOff, BrainCircuit, Activity, Users, Zap, Bot, AlertTriangle } from 'lucide-react';
 import { motion } from 'motion/react';
 import IdeaSwarm from './components/IdeaSwarm';
 import IdeaVoting from './components/IdeaVoting';
@@ -20,17 +20,48 @@ export default function App() {
   const [isEditingTopic, setIsEditingTopic] = useState(false);
   const [ideas, setIdeas] = useState<any[]>([]);
   const [swarmEdges, setSwarmEdges] = useState<any[]>([]);
+  const [credits, setCredits] = useState<number>(100);
+  const [userVotes, setUserVotes] = useState<Record<string, number>>({});
   const ideasRef = useRef<any[]>([]);
   useEffect(() => { ideasRef.current = ideas; }, [ideas]);
   const [flowNodes, setFlowNodes] = useState<Node[]>([]);
   const [flowEdges, setFlowEdges] = useState<Edge[]>([]);
   const [isRecording, setIsRecording] = useState(false);
+  const [isCameraActive, setIsCameraActive] = useState(false);
   const [isSimulating, setIsSimulating] = useState(false);
+  const [audioError, setAudioError] = useState<string | null>(null);
+  const [manualIdea, setManualIdea] = useState("");
   const [selectedIdeaId, setSelectedIdeaId] = useState<string | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const videoStreamRef = useRef<MediaStream | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const stopSimulationRef = useRef<(() => void) | null>(null);
+  const audioQueueRef = useRef<AudioBuffer[]>([]);
+  const nextPlayTimeRef = useRef<number>(0);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const videoIntervalRef = useRef<number | null>(null);
+
+  const handleVote = (ideaId: string, change: number) => {
+    const currentVotes = userVotes[ideaId] || 0;
+    const newVotes = currentVotes + change;
+    
+    if (newVotes < 0) return; // Can't have negative votes cast by a user
+    
+    const currentCost = currentVotes * currentVotes;
+    const newCost = newVotes * newVotes;
+    const costDifference = newCost - currentCost;
+    
+    if (credits - costDifference < 0) {
+      alert("Not enough credits for quadratic voting!");
+      return;
+    }
+    
+    setCredits(prev => prev - costDifference);
+    setUserVotes(prev => ({ ...prev, [ideaId]: newVotes }));
+    socket?.emit('update_idea_weight', { ideaId, weightChange: change });
+  };
 
   const handleEditIdea = (id: string, text: string, cluster: string) => {
     if (socket) {
@@ -90,6 +121,12 @@ export default function App() {
       setSwarmEdges(newEdges);
     });
 
+    newSocket.on('idea_weight_updated', ({ ideaId, weight }: { ideaId: string, weight: number }) => {
+      setIdeas((prev) => prev.map(i => 
+        i.id === ideaId ? { ...i, weight } : i
+      ));
+    });
+
     newSocket.on('flow_updated', (data) => {
       setFlowNodes(data.nodes || []);
       setFlowEdges(data.edges || []);
@@ -97,6 +134,55 @@ export default function App() {
 
     newSocket.on('phase_changed', (newPhase) => {
       setPhase(newPhase);
+    });
+
+    newSocket.on('audio_response', async (base64Audio: string) => {
+      if (!audioContextRef.current) return;
+      const ctx = audioContextRef.current;
+      
+      // Decode base64 to ArrayBuffer
+      const binaryString = window.atob(base64Audio);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      
+      // The Gemini API returns 24kHz PCM 16-bit audio
+      // We need to convert it to a Float32Array for the AudioBuffer
+      const int16Array = new Int16Array(bytes.buffer);
+      const float32Array = new Float32Array(int16Array.length);
+      for (let i = 0; i < int16Array.length; i++) {
+        float32Array[i] = int16Array[i] / 32768.0;
+      }
+      
+      const audioBuffer = ctx.createBuffer(1, float32Array.length, 24000);
+      audioBuffer.getChannelData(0).set(float32Array);
+      
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+      
+      const currentTime = ctx.currentTime;
+      if (nextPlayTimeRef.current < currentTime) {
+        nextPlayTimeRef.current = currentTime;
+      }
+      
+      source.start(nextPlayTimeRef.current);
+      nextPlayTimeRef.current += audioBuffer.duration;
+    });
+
+    newSocket.on('audio_session_closed', () => {
+      setIsRecording(false);
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach(t => t.stop());
+      }
+      if (workletNodeRef.current) {
+        workletNodeRef.current.disconnect();
+      }
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+        audioContextRef.current.close();
+      }
     });
 
     return () => {
@@ -115,7 +201,7 @@ export default function App() {
       if (workletNodeRef.current) {
         workletNodeRef.current.disconnect();
       }
-      if (audioContextRef.current) {
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
         audioContextRef.current.close();
       }
       setIsRecording(false);
@@ -125,31 +211,16 @@ export default function App() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
+      
       const audioContext = new window.AudioContext({ sampleRate: 16000 });
       audioContextRef.current = audioContext;
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
 
       const source = audioContext.createMediaStreamSource(stream);
       
       const workletCode = `
-        const base64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-        function arrayBufferToBase64(buffer) {
-          const bytes = new Uint8Array(buffer);
-          let result = '';
-          const len = bytes.length;
-          for (let i = 0; i < len; i += 3) {
-            result += base64chars[bytes[i] >> 2];
-            result += base64chars[((bytes[i] & 3) << 4) | (bytes[i + 1] >> 4)];
-            result += base64chars[((bytes[i + 1] & 15) << 2) | (bytes[i + 2] >> 6)];
-            result += base64chars[bytes[i + 2] & 63];
-          }
-          if (len % 3 === 2) {
-            result = result.substring(0, result.length - 1) + '=';
-          } else if (len % 3 === 1) {
-            result = result.substring(0, result.length - 2) + '==';
-          }
-          return result;
-        }
-
         class PCMProcessor extends AudioWorkletProcessor {
           constructor() {
             super();
@@ -165,8 +236,7 @@ export default function App() {
                 this.buffer[this.bytesWritten++] = Math.max(-1, Math.min(1, channelData[i])) * 0x7FFF;
                 if (this.bytesWritten >= this.bufferSize) {
                   const outBuffer = new Int16Array(this.buffer);
-                  const base64Data = arrayBufferToBase64(outBuffer.buffer);
-                  this.port.postMessage(base64Data);
+                  this.port.postMessage(outBuffer.buffer, [outBuffer.buffer]);
                   this.bytesWritten = 0;
                 }
               }
@@ -187,16 +257,67 @@ export default function App() {
       source.connect(workletNode);
       workletNode.connect(audioContext.destination);
 
+      console.log("Emitting start_audio_session");
       socket?.emit('start_audio_session', { topic, userName: userNameRef.current });
 
       workletNode.port.onmessage = (e) => {
-        const base64Data = e.data;
+        const buffer = e.data;
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        const base64Data = window.btoa(binary);
         socket?.emit('audio_chunk', base64Data);
       };
 
       setIsRecording(true);
-    } catch (err) {
+      setAudioError(null);
+    } catch (err: any) {
       console.error("Failed to start recording:", err);
+      setAudioError(err.message || "Could not start audio source");
+    }
+  };
+
+  const toggleCamera = async () => {
+    if (isCameraActive) {
+      socket?.emit('stop_video_session');
+      if (videoStreamRef.current) {
+        videoStreamRef.current.getTracks().forEach(t => t.stop());
+      }
+      if (videoIntervalRef.current) {
+        window.clearInterval(videoIntervalRef.current);
+        videoIntervalRef.current = null;
+      }
+      setIsCameraActive(false);
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      videoStreamRef.current = stream;
+      
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+
+      socket?.emit('start_video_session', { topic, userName: userNameRef.current });
+
+      videoIntervalRef.current = window.setInterval(() => {
+        if (videoRef.current && canvasRef.current) {
+          const ctx = canvasRef.current.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(videoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
+            const base64Image = canvasRef.current.toDataURL('image/jpeg', 0.5).split(',')[1];
+            socket?.emit('video_chunk', base64Image);
+          }
+        }
+      }, 1000); // 1 frame per second
+
+      setIsCameraActive(true);
+    } catch (err: any) {
+      console.error("Failed to start camera:", err);
+      alert("Could not access camera: " + err.message);
     }
   };
 
@@ -494,17 +615,42 @@ export default function App() {
             </button>
           )}
 
-          <button
-            onClick={toggleRecording}
-            className={`flex items-center gap-2 px-4 py-2 rounded-full font-mono text-sm transition-all ${
-              isRecording 
-                ? 'bg-red-500/20 text-red-500 border border-red-500/50 shadow-[0_0_15px_rgba(239,68,68,0.5)]' 
-                : 'bg-white/10 text-white hover:bg-white/20'
-            }`}
-          >
-            {isRecording ? <Mic className="w-4 h-4 animate-pulse" /> : <MicOff className="w-4 h-4" />}
-            {isRecording ? 'Listening...' : 'Join Swarm'}
-          </button>
+          <div className="flex items-center gap-2">
+            <video 
+              ref={videoRef} 
+              autoPlay 
+              playsInline 
+              muted 
+              className={`w-16 h-12 object-cover rounded-md border border-white/10 ${isCameraActive ? 'block' : 'hidden'}`} 
+            />
+            <canvas ref={canvasRef} className="hidden" width={320} height={240} />
+            <div className="flex items-center gap-2 bg-white/5 border border-white/10 rounded-full px-4 py-2">
+              <span className="text-xs font-mono text-white/50 uppercase">Credits</span>
+              <span className="text-sm font-bold text-[#00FF00]">{credits}</span>
+            </div>
+            <button
+              onClick={toggleCamera}
+              className={`flex items-center gap-2 px-4 py-2 rounded-full font-mono text-sm transition-all ${
+                isCameraActive 
+                  ? 'bg-blue-500/20 text-blue-400 border border-blue-500/50 shadow-[0_0_15px_rgba(59,130,246,0.5)]' 
+                  : 'bg-white/10 text-white hover:bg-white/20'
+              }`}
+            >
+              {isCameraActive ? <Camera className="w-4 h-4" /> : <CameraOff className="w-4 h-4" />}
+              {isCameraActive ? 'Camera On' : 'Camera Off'}
+            </button>
+            <button
+              onClick={toggleRecording}
+              className={`flex items-center gap-2 px-4 py-2 rounded-full font-mono text-sm transition-all ${
+                isRecording 
+                  ? 'bg-red-500/20 text-red-500 border border-red-500/50 shadow-[0_0_15px_rgba(239,68,68,0.5)]' 
+                  : 'bg-white/10 text-white hover:bg-white/20'
+              }`}
+            >
+              {isRecording ? <Mic className="w-4 h-4 animate-pulse" /> : <MicOff className="w-4 h-4" />}
+              {isRecording ? 'Listening...' : 'Join Swarm'}
+            </button>
+          </div>
         </div>
       </header>
 
@@ -515,11 +661,46 @@ export default function App() {
           {(phase === 'divergent' || phase === 'forging') && (
             <div className="absolute inset-0">
               <IdeaSwarm ideas={ideas} edges={swarmEdges} onIdeaClick={(idea) => setSelectedIdeaId(idea.id)} />
-              <div className="absolute bottom-6 left-6 pointer-events-none">
+              <div className="absolute bottom-6 left-6 right-6 flex flex-col gap-2 pointer-events-none">
                 <div className="flex items-center gap-2 text-white/50 font-mono text-xs uppercase tracking-wider">
                   <Activity className="w-4 h-4" />
                   <span>Phase 1: Idea Swarm (Divergent)</span>
                 </div>
+                
+                {audioError && (
+                  <div className="flex items-center gap-3 bg-red-950/80 backdrop-blur-md border border-red-500/50 rounded-lg px-4 py-3 pointer-events-auto shadow-lg max-w-2xl">
+                    <AlertTriangle className="w-5 h-5 text-red-400 flex-shrink-0" />
+                    <div className="flex flex-col flex-1">
+                      <span className="text-red-400 text-xs font-mono mb-1">Microphone access failed: {audioError}</span>
+                      <div className="flex items-center gap-2">
+                        <input 
+                          type="text" 
+                          value={manualIdea}
+                          onChange={e => setManualIdea(e.target.value)}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter' && manualIdea.trim()) {
+                              socket?.emit('add_idea', { text: manualIdea, authorName: userNameRef.current });
+                              setManualIdea('');
+                            }
+                          }}
+                          placeholder="Type your idea here and press Enter..."
+                          className="flex-1 bg-black/50 border border-red-500/30 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-red-400 font-mono"
+                        />
+                        <button 
+                          onClick={() => {
+                            if (manualIdea.trim()) {
+                              socket?.emit('add_idea', { text: manualIdea, authorName: userNameRef.current });
+                              setManualIdea('');
+                            }
+                          }}
+                          className="bg-red-500/20 hover:bg-red-500/40 text-red-300 px-3 py-1.5 rounded text-xs font-bold uppercase tracking-wider transition-colors"
+                        >
+                          Send
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Edit Idea Panel */}
@@ -545,7 +726,23 @@ export default function App() {
                         </div>
                         <div>
                           <label className="block text-xs text-white/50 font-mono uppercase mb-1">Weight (Votes)</label>
-                          <div className="text-sm text-white/90 bg-white/5 px-3 py-2 rounded border border-white/10">{idea.weight}</div>
+                          <div className="flex items-center gap-3">
+                            <div className="text-sm text-white/90 bg-white/5 px-3 py-2 rounded border border-white/10">{idea.weight}</div>
+                            <button 
+                              onClick={() => handleVote(idea.id, 1)}
+                              className="bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded text-xs font-mono transition-colors"
+                              title={`Cost: ${Math.pow((userVotes[idea.id] || 0) + 1, 2) - Math.pow(userVotes[idea.id] || 0, 2)} credits`}
+                            >
+                              +1 Upvote
+                            </button>
+                            <button 
+                              onClick={() => handleVote(idea.id, -1)}
+                              className="bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded text-xs font-mono transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                              disabled={(userVotes[idea.id] || 0) <= 0}
+                            >
+                              -1 Downvote
+                            </button>
+                          </div>
                         </div>
                         <div>
                           <label className="block text-xs text-white/50 font-mono uppercase mb-1">Cluster</label>
