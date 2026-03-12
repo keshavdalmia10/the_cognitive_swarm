@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gemini Live API"
+  short_description: "Build and debug Gemini Live API integrations"
+  default_prompt: "Use $gemini-live-api to plan or implement a Gemini Live API voice, video, or realtime tool workflow."

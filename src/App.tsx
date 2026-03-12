@@ -4,16 +4,17 @@ import { Mic, MicOff, Camera, CameraOff, BrainCircuit, Activity, Users, Zap, Bot
 import { motion } from 'motion/react';
 import IdeaSwarm from './components/IdeaSwarm';
 import IdeaVoting from './components/IdeaVoting';
+import ArtifactCanvas, { ArtifactData } from './components/ArtifactCanvas';
 import { startSimulation } from './utils/simulator';
-import { ReactFlow, Background, Controls, MiniMap, Node, Edge } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import dagre from 'dagre';
 
 export default function App() {
   const [userName, setUserName] = useState('');
   const userNameRef = useRef('');
   useEffect(() => { userNameRef.current = userName; }, [userName]);
   const [role, setRole] = useState<'admin' | 'participant' | null>(null);
+  const roleRef = useRef<'admin' | 'participant' | null>(null);
+  useEffect(() => { roleRef.current = role; }, [role]);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [phase, setPhase] = useState<'divergent' | 'convergent' | 'forging'>('divergent');
   const [topic, setTopic] = useState<string>('');
@@ -24,15 +25,21 @@ export default function App() {
   const [userVotes, setUserVotes] = useState<Record<string, number>>({});
   const ideasRef = useRef<any[]>([]);
   useEffect(() => { ideasRef.current = ideas; }, [ideas]);
-  const [flowNodes, setFlowNodes] = useState<Node[]>([]);
-  const [flowEdges, setFlowEdges] = useState<Edge[]>([]);
+  const [artifact, setArtifact] = useState<ArtifactData | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [isSimulating, setIsSimulating] = useState(false);
   const [audioError, setAudioError] = useState<string | null>(null);
+  const [directionSuggestion, setDirectionSuggestion] = useState<{
+    suggestion: string;
+    rationale?: string;
+    createdAt: number;
+    kind?: 'direction' | 'audience_nudge';
+  } | null>(null);
   const [manualIdea, setManualIdea] = useState("");
   const [selectedIdeaId, setSelectedIdeaId] = useState<string | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const playbackAudioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const videoStreamRef = useRef<MediaStream | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
@@ -43,6 +50,92 @@ export default function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoIntervalRef = useRef<number | null>(null);
+  const suggestionTimeoutRef = useRef<number | null>(null);
+  const anchorAnnouncementIdRef = useRef(0);
+
+  const ensurePlaybackAudioContext = async () => {
+    const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioContextCtor) return null;
+
+    if (!playbackAudioContextRef.current) {
+      playbackAudioContextRef.current = new AudioContextCtor();
+    }
+
+    if (playbackAudioContextRef.current.state === 'suspended') {
+      await playbackAudioContextRef.current.resume();
+    }
+
+    return playbackAudioContextRef.current;
+  };
+
+  const playGeminiAudioChunk = async (base64Audio: string) => {
+    const ctx = await ensurePlaybackAudioContext();
+    if (!ctx) return;
+
+    const binaryString = window.atob(base64Audio);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+
+    const int16Array = new Int16Array(bytes.buffer);
+    const float32Array = new Float32Array(int16Array.length);
+    for (let i = 0; i < int16Array.length; i++) {
+      float32Array[i] = int16Array[i] / 32768.0;
+    }
+
+    if (float32Array.length === 0) return;
+
+    const audioBuffer = ctx.createBuffer(1, float32Array.length, 24000);
+    audioBuffer.getChannelData(0).set(float32Array);
+
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+
+    const currentTime = ctx.currentTime;
+    if (nextPlayTimeRef.current < currentTime) {
+      nextPlayTimeRef.current = currentTime;
+    }
+
+    source.start(nextPlayTimeRef.current);
+    nextPlayTimeRef.current += audioBuffer.duration;
+
+    activeSourcesRef.current.push(source);
+    source.onended = () => {
+      activeSourcesRef.current = activeSourcesRef.current.filter((activeSource) => activeSource !== source);
+    };
+  };
+
+  const interruptAnchorPlayback = (clearSuggestion = false) => {
+    audioQueueRef.current = [];
+    activeSourcesRef.current.forEach(source => {
+      try {
+        source.stop();
+      } catch (e) {}
+    });
+    activeSourcesRef.current = [];
+    const playbackContext = playbackAudioContextRef.current || audioContextRef.current;
+    if (playbackContext) {
+      nextPlayTimeRef.current = playbackContext.currentTime;
+    }
+    if (clearSuggestion) {
+      setDirectionSuggestion(null);
+      if (suggestionTimeoutRef.current) {
+        window.clearTimeout(suggestionTimeoutRef.current);
+        suggestionTimeoutRef.current = null;
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!socket || !role || !userName.trim()) return;
+    socket.emit('register_participant', {
+      userName: userName.trim(),
+      role,
+    });
+  }, [socket, role, userName]);
 
   const handleVote = (ideaId: string, change: number) => {
     const currentVotes = userVotes[ideaId] || 0;
@@ -85,10 +178,7 @@ export default function App() {
       setPhase(state.phase);
       setIdeas(state.ideas);
       setSwarmEdges(state.edges || []);
-      if (state.flowData) {
-        setFlowNodes(state.flowData.nodes || []);
-        setFlowEdges(state.flowData.edges || []);
-      }
+      setArtifact(state.artifactData || null);
     });
 
     newSocket.on('topic_updated', (newTopic) => {
@@ -133,70 +223,50 @@ export default function App() {
       ));
     });
 
-    newSocket.on('flow_updated', (data) => {
-      setFlowNodes(data.nodes || []);
-      setFlowEdges(data.edges || []);
+    newSocket.on('artifact_updated', (data: ArtifactData) => {
+      setArtifact(data);
+      setForgeError(null);
+      setIsForging(false);
     });
 
     newSocket.on('phase_changed', (newPhase) => {
       setPhase(newPhase);
     });
 
-    newSocket.on('audio_interrupted', () => {
-      audioQueueRef.current = [];
-      activeSourcesRef.current.forEach(source => {
-        try {
-          source.stop();
-        } catch (e) {}
-      });
-      activeSourcesRef.current = [];
-      if (audioContextRef.current) {
-        nextPlayTimeRef.current = audioContextRef.current.currentTime;
+    newSocket.on('direction_suggestion', (payload: { suggestion: string; rationale?: string; createdAt: number; kind?: 'direction' | 'audience_nudge' }) => {
+      if (!roleRef.current) return;
+      setDirectionSuggestion(payload);
+      if (suggestionTimeoutRef.current) {
+        window.clearTimeout(suggestionTimeoutRef.current);
       }
+      suggestionTimeoutRef.current = window.setTimeout(() => {
+        setDirectionSuggestion(null);
+      }, 12000);
+    });
+
+    newSocket.on('anchor_audio_interrupted', ({ announcementId }: { announcementId: number }) => {
+      if (announcementId >= anchorAnnouncementIdRef.current) {
+        anchorAnnouncementIdRef.current = announcementId;
+        interruptAnchorPlayback();
+      }
+    });
+
+    newSocket.on('anchor_audio_response', async ({ announcementId, data }: { announcementId: number; data: string }) => {
+      if (announcementId < anchorAnnouncementIdRef.current) return;
+      if (announcementId > anchorAnnouncementIdRef.current) {
+        anchorAnnouncementIdRef.current = announcementId;
+        interruptAnchorPlayback();
+      }
+      await playGeminiAudioChunk(data);
+    });
+
+    newSocket.on('audio_interrupted', () => {
+      interruptAnchorPlayback();
     });
 
     newSocket.on('audio_response', async (base64Audio: string) => {
       console.log("Received audio response of length:", base64Audio.length);
-      if (!audioContextRef.current) return;
-      const ctx = audioContextRef.current;
-      
-      // Decode base64 to ArrayBuffer
-      const binaryString = window.atob(base64Audio);
-      const len = binaryString.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-      
-      // The Gemini API returns 24kHz PCM 16-bit audio
-      // We need to convert it to a Float32Array for the AudioBuffer
-      const int16Array = new Int16Array(bytes.buffer);
-      const float32Array = new Float32Array(int16Array.length);
-      for (let i = 0; i < int16Array.length; i++) {
-        float32Array[i] = int16Array[i] / 32768.0;
-      }
-      
-      if (float32Array.length === 0) return;
-      
-      const audioBuffer = ctx.createBuffer(1, float32Array.length, 24000);
-      audioBuffer.getChannelData(0).set(float32Array);
-      
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(ctx.destination);
-      
-      const currentTime = ctx.currentTime;
-      if (nextPlayTimeRef.current < currentTime) {
-        nextPlayTimeRef.current = currentTime;
-      }
-      
-      source.start(nextPlayTimeRef.current);
-      nextPlayTimeRef.current += audioBuffer.duration;
-      
-      activeSourcesRef.current.push(source);
-      source.onended = () => {
-        activeSourcesRef.current = activeSourcesRef.current.filter(s => s !== source);
-      };
+      await playGeminiAudioChunk(base64Audio);
     });
 
     newSocket.on('audio_session_closed', () => {
@@ -213,6 +283,9 @@ export default function App() {
     });
 
     return () => {
+      if (suggestionTimeoutRef.current) {
+        window.clearTimeout(suggestionTimeoutRef.current);
+      }
       newSocket.disconnect();
     };
   }, []);
@@ -236,6 +309,9 @@ export default function App() {
     }
 
     try {
+      interruptAnchorPlayback(true);
+      socket?.emit('interrupt_anchor');
+      await ensurePlaybackAudioContext();
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw new Error("Browser does not support audio recording or permissions are missing.");
       }
@@ -351,6 +427,7 @@ export default function App() {
   const [isForging, setIsForging] = useState(false);
 
   const requestSuggestion = () => {
+    void ensurePlaybackAudioContext();
     socket?.emit('suggest_direction');
   };
 
@@ -358,117 +435,10 @@ export default function App() {
     try {
       setForgeError(null);
       setIsForging(true);
-      
-      const currentIdeas = ideasRef.current;
-      
-      const safeTopic = (topic || 'Brainstorming Session').replace(/["{}()\[\]]/g, '');
-
-      if (currentIdeas.length === 0) {
-        const emptyNodes: Node[] = [
-          { id: 'root', position: { x: 0, y: 0 }, data: { label: safeTopic }, style: { background: '#00FF00', color: '#000', fontWeight: 'bold', padding: '10px', borderRadius: '8px' } },
-          { id: 'empty', position: { x: 0, y: 100 }, data: { label: 'No ideas generated yet' }, style: { background: '#111', color: '#fff', border: '1px solid #333', padding: '10px', borderRadius: '8px' } }
-        ];
-        const emptyEdges: Edge[] = [
-          { id: 'e-root-empty', source: 'root', target: 'empty', animated: true, style: { stroke: '#00FF00' } }
-        ];
-        socket?.emit('update_flow', { nodes: emptyNodes, edges: emptyEdges });
-        return;
-      }
-
-      // 1. Sort by weight (highest first) and take top 30
-      const topIdeas = [...currentIdeas].sort((a, b) => (b.weight || 0) - (a.weight || 0)).slice(0, 30);
-      
-      // 2. Group by cluster
-      const clusters = new Map<string, typeof currentIdeas>();
-      topIdeas.forEach(idea => {
-        const c = idea.cluster || 'General';
-        if (!clusters.has(c)) clusters.set(c, []);
-        clusters.get(c)!.push(idea);
-      });
-
-      // 3. Generate React Flow Nodes & Edges
-      const newNodes: Node[] = [];
-      const newEdges: Edge[] = [];
-
-      const dagreGraph = new dagre.graphlib.Graph();
-      dagreGraph.setDefaultEdgeLabel(() => ({}));
-      dagreGraph.setGraph({ rankdir: 'TB', ranksep: 100, nodesep: 50 });
-
-      // Root Node
-      newNodes.push({
-        id: 'root',
-        data: { label: safeTopic },
-        position: { x: 0, y: 0 },
-        style: { background: '#00FF00', color: '#000', fontWeight: 'bold', padding: '15px', borderRadius: '10px', fontSize: '18px', border: '2px solid #000' }
-      });
-      dagreGraph.setNode('root', { width: 250, height: 60 });
-
-      let clusterIndex = 0;
-      for (const [clusterName, clusterIdeas] of clusters.entries()) {
-        const cId = `C${clusterIndex}`;
-        const safeClusterName = clusterName.replace(/["{}()\[\]]/g, '');
-        
-        newNodes.push({
-          id: cId,
-          data: { label: safeClusterName },
-          position: { x: 0, y: 0 },
-          style: { background: '#111', color: '#00FF00', fontWeight: 'bold', padding: '10px', borderRadius: '8px', border: '2px dashed #00FF00' }
-        });
-        dagreGraph.setNode(cId, { width: 200, height: 50 });
-        
-        newEdges.push({
-          id: `e-root-${cId}`,
-          source: 'root',
-          target: cId,
-          animated: true,
-          style: { stroke: '#00FF00', strokeWidth: 2 }
-        });
-        dagreGraph.setEdge('root', cId);
-        
-        clusterIdeas.forEach((idea, i) => {
-          const iId = `I${clusterIndex}_${i}`;
-          const safeText = idea.text.replace(/["{}()\[\]]/g, '').replace(/\n/g, ' ').substring(0, 60) + (idea.text.length > 60 ? '...' : '');
-          
-          const weight = idea.weight || 1;
-          const r = Math.min(255, 26 + (weight * 10));
-          const g = Math.min(255, 54 + (weight * 15));
-          const b = Math.min(255, 93 + (weight * 20));
-          
-          newNodes.push({
-            id: iId,
-            data: { label: safeText },
-            position: { x: 0, y: 0 },
-            style: { background: `rgb(${r},${g},${b})`, color: '#fff', padding: '10px', borderRadius: '8px', border: `2px solid #63b3ed`, width: 250 }
-          });
-          dagreGraph.setNode(iId, { width: 250, height: 60 });
-          
-          newEdges.push({
-            id: `e-${cId}-${iId}`,
-            source: cId,
-            target: iId,
-            style: { stroke: '#63b3ed', strokeWidth: Math.min(4, 1 + weight * 0.5) }
-          });
-          dagreGraph.setEdge(cId, iId);
-        });
-        clusterIndex++;
-      }
-
-      // Apply dagre layout
-      dagre.layout(dagreGraph);
-      
-      newNodes.forEach((node) => {
-        const nodeWithPosition = dagreGraph.node(node.id);
-        node.position = {
-          x: nodeWithPosition.x - nodeWithPosition.width / 2,
-          y: nodeWithPosition.y - nodeWithPosition.height / 2,
-        };
-      });
-
-      socket?.emit('update_flow', { nodes: newNodes, edges: newEdges });
+      socket?.emit('forge_artifact');
     } catch (error: any) {
       console.error("Manual forge failed:", error);
       setForgeError(error.message || "Failed to generate diagram. Please try again.");
-    } finally {
       setIsForging(false);
     }
   };
@@ -511,6 +481,7 @@ export default function App() {
           <div className="space-y-4">
             <button
               onClick={() => {
+                void ensurePlaybackAudioContext();
                 setRole('admin');
                 socket?.emit('set_topic', topic);
               }}
@@ -530,6 +501,7 @@ export default function App() {
 
             <button
               onClick={() => {
+                void ensurePlaybackAudioContext();
                 setRole('participant');
                 socket?.emit('set_topic', topic);
               }}
@@ -657,13 +629,13 @@ export default function App() {
               {isCameraActive ? <Camera className="w-4 h-4" /> : <CameraOff className="w-4 h-4" />}
               {isCameraActive ? 'Camera On' : 'Camera Off'}
             </button>
-            {isRecording && (
+            {role === 'admin' && phase === 'divergent' && (
               <button
                 onClick={requestSuggestion}
                 className="flex items-center gap-2 px-4 py-2 rounded-full font-mono text-sm transition-all bg-emerald-500/20 text-emerald-400 border border-emerald-500/50 hover:bg-emerald-500/30"
               >
                 <BrainCircuit className="w-4 h-4" />
-                Suggest Direction
+                Cue Anchor
               </button>
             )}
             <button
@@ -687,12 +659,32 @@ export default function App() {
         <div className="flex-1 relative border-r border-white/10 overflow-hidden">
           {(phase === 'divergent' || phase === 'forging') && (
             <div className="absolute inset-0">
-              <IdeaSwarm ideas={ideas} edges={swarmEdges} onIdeaClick={(idea) => setSelectedIdeaId(idea.id)} />
+              <IdeaSwarm
+                ideas={ideas}
+                edges={swarmEdges}
+                selectedIdeaId={selectedIdeaId}
+                onIdeaClick={(idea) => setSelectedIdeaId(idea.id)}
+              />
               <div className="absolute bottom-6 left-6 right-6 flex flex-col gap-2 pointer-events-none">
                 <div className="flex items-center gap-2 text-white/50 font-mono text-xs uppercase tracking-wider">
                   <Activity className="w-4 h-4" />
                   <span>Phase 1: Idea Swarm (Divergent)</span>
                 </div>
+
+                {directionSuggestion && (
+                  <div className="flex items-start gap-3 bg-emerald-950/85 backdrop-blur-md border border-emerald-400/40 rounded-lg px-4 py-3 pointer-events-none shadow-lg max-w-2xl">
+                    <BrainCircuit className="w-5 h-5 text-emerald-300 flex-shrink-0 mt-0.5" />
+                    <div className="flex flex-col">
+                      <span className="text-emerald-300 text-xs font-mono uppercase tracking-wider mb-1">
+                        {directionSuggestion.kind === 'audience_nudge' ? 'Anchor Cue' : 'Untouched Direction'}
+                      </span>
+                      <span className="text-white text-sm">{directionSuggestion.suggestion}</span>
+                      {directionSuggestion.rationale && (
+                        <span className="text-white/60 text-xs font-mono mt-1">{directionSuggestion.rationale}</span>
+                      )}
+                    </div>
+                  </div>
+                )}
                 
                 {audioError && (
                   <div className="flex items-center gap-3 bg-red-950/80 backdrop-blur-md border border-red-500/50 rounded-lg px-4 py-3 pointer-events-auto shadow-lg max-w-2xl">
@@ -902,25 +894,7 @@ export default function App() {
               <span className="font-mono text-xs uppercase tracking-wider text-white/70">Live Artifact</span>
             </div>
             <div className="flex-1 overflow-hidden relative">
-              {flowNodes.length > 0 ? (
-                <ReactFlow
-                  nodes={flowNodes}
-                  edges={flowEdges}
-                  fitView
-                  className="bg-[#050505]"
-                  minZoom={0.1}
-                  maxZoom={4}
-                  colorMode="dark"
-                >
-                  <Background color="#333" gap={16} />
-                  <Controls style={{ backgroundColor: '#111', fill: '#fff' }} />
-                  <MiniMap nodeColor="#00FF00" maskColor="rgba(0, 0, 0, 0.8)" style={{ backgroundColor: '#111' }} />
-                </ReactFlow>
-              ) : (
-                <div className="absolute inset-0 flex items-center justify-center text-white/30 font-mono text-sm p-8 text-center">
-                  Waiting for Administrator to forge the diagram...
-                </div>
-              )}
+              <ArtifactCanvas artifact={artifact} />
             </div>
           </div>
           
