@@ -15,10 +15,23 @@ import {
 } from "./src/utils/swarmPolicy.ts";
 import { buildFallbackArtifact, getDiagramLabel, inferDiagramType } from "./src/utils/artifactPolicy.ts";
 import type { ArtifactDiagramType, ArtifactIdea } from "./src/utils/artifactPolicy.ts";
+import { isAdmin, isValidPhase } from './src/utils/serverGuards.ts';
 
 dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
 function logToFile(_msg: string) {}
+
+function emitInlineAudio(
+  target: { emit: (eventName: string, payload: any) => boolean },
+  eventName: string,
+  inlineData?: { data?: string; mimeType?: string | null }
+) {
+  if (!inlineData?.data) return;
+  target.emit(eventName, {
+    data: inlineData.data,
+    mimeType: inlineData.mimeType,
+  });
+}
 
 function getAI() {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -205,6 +218,7 @@ async function startServer() {
                 io.emit("anchor_audio_response", {
                   announcementId: anchorResponseAnnouncementId,
                   data: part.inlineData.data,
+                  mimeType: part.inlineData.mimeType,
                 });
               }
             }
@@ -617,9 +631,7 @@ async function startServer() {
               const parts = message.serverContent.modelTurn.parts;
               if (parts) {
                 for (const part of parts) {
-                  if (part.inlineData?.data) {
-                    socket.emit("audio_response", part.inlineData.data);
-                  }
+                  emitInlineAudio(socket, "audio_response", part.inlineData);
                 }
               }
             }
@@ -918,7 +930,9 @@ async function startServer() {
 
     // Update topic
     socket.on("set_topic", (topic: string) => {
-      state.topic = topic;
+      if (!isAdmin(participants.get(socket.id))) return;
+      if (typeof topic !== 'string' || !topic.trim()) return;
+      state.topic = topic.trim();
       io.emit("topic_updated", state.topic);
     });
 
@@ -1032,6 +1046,8 @@ async function startServer() {
 
     // Phase transition
     socket.on("set_phase", (phase: string) => {
+      if (!isAdmin(participants.get(socket.id))) return;
+      if (!isValidPhase(phase)) return;
       state.phase = phase;
       io.emit("phase_changed", state.phase);
     });
