@@ -105,7 +105,9 @@ export default function App() {
     if (evenByteLength === 0) return;
 
     const pcmBytes = evenByteLength === bytes.byteLength ? bytes : bytes.slice(0, evenByteLength);
-    const int16Array = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength / 2);
+    const alignedBuffer = new ArrayBuffer(pcmBytes.byteLength);
+    new Uint8Array(alignedBuffer).set(pcmBytes);
+    const int16Array = new Int16Array(alignedBuffer);
     const float32Array = new Float32Array(int16Array.length);
     for (let i = 0; i < int16Array.length; i++) {
       float32Array[i] = int16Array[i] / 32768.0;
@@ -541,7 +543,6 @@ export default function App() {
               onClick={() => {
                 void ensurePlaybackAudioContext();
                 setRole('participant');
-                socket?.emit('set_topic', topic);
               }}
               disabled={!userName.trim() || !topic.trim()}
               className={`w-full py-4 px-6 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-all flex items-center justify-between group ${(!userName.trim() || !topic.trim()) ? 'opacity-50 cursor-not-allowed' : ''}`}
