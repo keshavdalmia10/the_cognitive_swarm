@@ -8,6 +8,31 @@ import ArtifactCanvas, { ArtifactData } from './components/ArtifactCanvas';
 import { startSimulation } from './utils/simulator';
 import '@xyflow/react/dist/style.css';
 
+const INPUT_SAMPLE_RATE = 16000;
+const DEFAULT_OUTPUT_SAMPLE_RATE = 24000;
+
+type AudioChunkPayload =
+  | string
+  | {
+      data: string;
+      mimeType?: string | null;
+    };
+
+function decodeBase64ToBytes(base64Audio: string) {
+  const binaryString = window.atob(base64Audio);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function parseSampleRateFromMimeType(mimeType?: string | null, fallback = DEFAULT_OUTPUT_SAMPLE_RATE) {
+  const match = mimeType?.match(/rate\s*=\s*(\d+)/i);
+  const parsed = match ? Number(match[1]) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 export default function App() {
   const [userName, setUserName] = useState('');
   const userNameRef = useRef('');
@@ -68,18 +93,17 @@ export default function App() {
     return playbackAudioContextRef.current;
   };
 
-  const playGeminiAudioChunk = async (base64Audio: string) => {
+  const playGeminiAudioChunk = async (chunk: AudioChunkPayload) => {
     const ctx = await ensurePlaybackAudioContext();
     if (!ctx) return;
 
-    const binaryString = window.atob(base64Audio);
-    const len = binaryString.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
+    const payload = typeof chunk === 'string' ? { data: chunk, mimeType: undefined } : chunk;
+    const bytes = decodeBase64ToBytes(payload.data);
+    const evenByteLength = bytes.byteLength - (bytes.byteLength % 2);
+    if (evenByteLength === 0) return;
 
-    const int16Array = new Int16Array(bytes.buffer);
+    const pcmBytes = evenByteLength === bytes.byteLength ? bytes : bytes.slice(0, evenByteLength);
+    const int16Array = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength / 2);
     const float32Array = new Float32Array(int16Array.length);
     for (let i = 0; i < int16Array.length; i++) {
       float32Array[i] = int16Array[i] / 32768.0;
@@ -87,7 +111,8 @@ export default function App() {
 
     if (float32Array.length === 0) return;
 
-    const audioBuffer = ctx.createBuffer(1, float32Array.length, 24000);
+    const sampleRate = parseSampleRateFromMimeType(payload.mimeType);
+    const audioBuffer = ctx.createBuffer(1, float32Array.length, sampleRate);
     audioBuffer.getChannelData(0).set(float32Array);
 
     const source = ctx.createBufferSource();
@@ -138,22 +163,6 @@ export default function App() {
   }, [socket, role, userName]);
 
   const handleVote = (ideaId: string, change: number) => {
-    const currentVotes = userVotes[ideaId] || 0;
-    const newVotes = currentVotes + change;
-    
-    if (newVotes < 0) return; // Can't have negative votes cast by a user
-    
-    const currentCost = currentVotes * currentVotes;
-    const newCost = newVotes * newVotes;
-    const costDifference = newCost - currentCost;
-    
-    if (credits - costDifference < 0) {
-      alert("Not enough credits for quadratic voting!");
-      return;
-    }
-    
-    setCredits(prev => prev - costDifference);
-    setUserVotes(prev => ({ ...prev, [ideaId]: newVotes }));
     socket?.emit('update_idea_weight', { ideaId, weightChange: change });
   };
 
@@ -229,6 +238,11 @@ export default function App() {
       setIsForging(false);
     });
 
+    newSocket.on('credits_updated', ({ credits, votes }: { credits: number, votes: Record<string, number> }) => {
+      setCredits(credits);
+      setUserVotes(votes);
+    });
+
     newSocket.on('phase_changed', (newPhase) => {
       setPhase(newPhase);
     });
@@ -251,22 +265,23 @@ export default function App() {
       }
     });
 
-    newSocket.on('anchor_audio_response', async ({ announcementId, data }: { announcementId: number; data: string }) => {
+    newSocket.on('anchor_audio_response', async ({ announcementId, data, mimeType }: { announcementId: number; data: string; mimeType?: string }) => {
       if (announcementId < anchorAnnouncementIdRef.current) return;
       if (announcementId > anchorAnnouncementIdRef.current) {
         anchorAnnouncementIdRef.current = announcementId;
         interruptAnchorPlayback();
       }
-      await playGeminiAudioChunk(data);
+      await playGeminiAudioChunk({ data, mimeType });
     });
 
     newSocket.on('audio_interrupted', () => {
       interruptAnchorPlayback();
     });
 
-    newSocket.on('audio_response', async (base64Audio: string) => {
-      console.log("Received audio response of length:", base64Audio.length);
-      await playGeminiAudioChunk(base64Audio);
+    newSocket.on('audio_response', async (audioChunk: AudioChunkPayload) => {
+      const payload = typeof audioChunk === 'string' ? { data: audioChunk, mimeType: undefined } : audioChunk;
+      console.log("Received audio response of length:", payload.data.length, "mimeType:", payload.mimeType || 'audio/pcm;rate=24000');
+      await playGeminiAudioChunk(payload);
     });
 
     newSocket.on('audio_session_closed', () => {
@@ -294,6 +309,10 @@ export default function App() {
   const toggleRecording = async () => {
     if (isRecording) {
       // Stop recording
+      if (workletNodeRef.current) {
+        workletNodeRef.current.port.postMessage({ type: 'flush' });
+        await new Promise((resolve) => window.setTimeout(resolve, 30));
+      }
       socket?.emit('stop_audio_session');
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach(t => t.stop());
@@ -317,8 +336,13 @@ export default function App() {
       }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
-      
-      const audioContext = new window.AudioContext({ sampleRate: 16000 });
+
+      const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContextCtor) {
+        throw new Error("Browser does not support AudioContext.");
+      }
+
+      const audioContext = new AudioContextCtor();
       audioContextRef.current = audioContext;
       if (audioContext.state === 'suspended') {
         await audioContext.resume();
@@ -328,8 +352,16 @@ export default function App() {
       
       await audioContext.audioWorklet.addModule('/pcm-processor.js');
       
-      const workletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+      const workletNode = new AudioWorkletNode(audioContext, 'pcm-processor', {
+        processorOptions: {
+          targetSampleRate: INPUT_SAMPLE_RATE,
+        },
+      });
       workletNodeRef.current = workletNode;
+
+      if (audioContext.sampleRate !== INPUT_SAMPLE_RATE) {
+        console.warn(`Microphone context is running at ${audioContext.sampleRate} Hz and will be resampled to ${INPUT_SAMPLE_RATE} Hz before upload.`);
+      }
 
       const silentGain = audioContext.createGain();
       silentGain.gain.value = 0;
@@ -790,7 +822,13 @@ export default function App() {
           
           {phase === 'convergent' && (
             <div className="absolute inset-0 p-8 overflow-y-auto">
-              <IdeaVoting ideas={ideas} socket={socket} />
+              <IdeaVoting
+                ideas={ideas}
+                socket={socket}
+                credits={credits}
+                userVotes={userVotes}
+                onVote={handleVote}
+              />
             </div>
           )}
 

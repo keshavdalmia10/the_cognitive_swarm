@@ -1,27 +1,20 @@
-import { useState } from 'react';
 import { motion } from 'motion/react';
 import { Socket } from 'socket.io-client';
-import { Check, Plus, Minus, ShieldAlert } from 'lucide-react';
+import { Plus, Minus, ShieldAlert } from 'lucide-react';
 
-export default function IdeaVoting({ ideas, socket }: { ideas: any[], socket: Socket | null }) {
-  const [tokens, setTokens] = useState(100);
-  const [votes, setVotes] = useState<Record<string, number>>({});
-
-  const handleVote = (ideaId: string, delta: number) => {
-    const currentVotes = votes[ideaId] || 0;
-    const newVotes = currentVotes + delta;
-    
-    if (newVotes < 0) return;
-    
-    const costDiff = (newVotes * newVotes) - (currentVotes * currentVotes);
-    
-    if (tokens - costDiff >= 0) {
-      setTokens(prev => prev - costDiff);
-      setVotes(prev => ({ ...prev, [ideaId]: newVotes }));
-      socket?.emit('update_idea_weight', { ideaId, weightChange: delta });
-    }
-  };
-
+export default function IdeaVoting({
+  ideas,
+  socket,
+  credits,
+  userVotes,
+  onVote,
+}: {
+  ideas: any[];
+  socket: Socket | null;
+  credits: number;
+  userVotes: Record<string, number>;
+  onVote: (ideaId: string, delta: number) => void;
+}) {
   return (
     <div className="w-full max-w-4xl mx-auto h-full flex flex-col">
       <div className="flex items-center justify-between mb-8 pb-4 border-b border-white/10">
@@ -35,17 +28,17 @@ export default function IdeaVoting({ ideas, socket }: { ideas: any[], socket: So
         </div>
         <div className="bg-[#141414] px-6 py-3 rounded-xl border border-[#00FF00]/30 flex flex-col items-end">
           <span className="text-xs font-mono text-white/50 uppercase">Influence Tokens</span>
-          <span className="text-2xl font-bold text-[#00FF00] font-mono">{tokens}</span>
+          <span className="text-2xl font-bold text-[#00FF00] font-mono">{credits}</span>
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto pr-4 space-y-4">
-        {ideas.sort((a, b) => b.weight - a.weight).map((idea) => {
-          const myVotes = votes[idea.id] || 0;
+        {[...ideas].sort((a, b) => (b.weight || 0) - (a.weight || 0)).map((idea) => {
+          const myVotes = userVotes[idea.id] || 0;
           const nextCost = ((myVotes + 1) * (myVotes + 1)) - (myVotes * myVotes);
-          
+
           return (
-            <motion.div 
+            <motion.div
               key={idea.id}
               layout
               className="bg-[#141414] rounded-xl p-5 border border-white/5 flex items-center justify-between gap-6 hover:border-white/20 transition-colors"
@@ -66,21 +59,21 @@ export default function IdeaVoting({ ideas, socket }: { ideas: any[], socket: So
 
               <div className="flex items-center gap-4 bg-black/50 p-2 rounded-lg border border-white/5">
                 <button
-                  onClick={() => handleVote(idea.id, -1)}
+                  onClick={() => onVote(idea.id, -1)}
                   disabled={myVotes === 0}
                   className="p-2 rounded-md hover:bg-white/10 disabled:opacity-30 transition-colors"
                 >
                   <Minus className="w-4 h-4" />
                 </button>
-                
+
                 <div className="flex flex-col items-center min-w-[40px]">
                   <span className="text-xl font-bold font-mono">{myVotes}</span>
                   <span className="text-[10px] text-white/30 font-mono uppercase">Votes</span>
                 </div>
 
                 <button
-                  onClick={() => handleVote(idea.id, 1)}
-                  disabled={tokens < nextCost}
+                  onClick={() => onVote(idea.id, 1)}
+                  disabled={credits < nextCost}
                   className="p-2 rounded-md hover:bg-white/10 disabled:opacity-30 transition-colors"
                   title={`Cost: ${nextCost} tokens`}
                 >
@@ -90,7 +83,7 @@ export default function IdeaVoting({ ideas, socket }: { ideas: any[], socket: So
             </motion.div>
           );
         })}
-        
+
         {ideas.length === 0 && (
           <div className="flex flex-col items-center justify-center h-64 text-white/30 gap-4">
             <ShieldAlert className="w-12 h-12 opacity-50" />
