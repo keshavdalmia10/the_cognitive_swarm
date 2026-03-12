@@ -78,6 +78,8 @@ async function startServer() {
     }
   });
 
+  const MAX_IDEAS = 200;
+
   // Global State for the Swarm
   let state = {
     topic: '',
@@ -540,6 +542,11 @@ async function startServer() {
             initialPosition: [(Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20],
             targetPosition: null as any
           };
+          if (state.ideas.length >= MAX_IDEAS) {
+            const minIndex = state.ideas.reduce((minIdx, idea, idx, arr) =>
+              (idea.weight || 0) < (arr[minIdx].weight || 0) ? idx : minIdx, 0);
+            state.ideas.splice(minIndex, 1);
+          }
           state.ideas.push(newIdea);
           pendingIdeas.push(newIdea);
           lastIdeaTime = Date.now();
@@ -668,6 +675,11 @@ async function startServer() {
                       initialPosition: [(Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20],
                       targetPosition: null as any
                     };
+                    if (state.ideas.length >= MAX_IDEAS) {
+                      const minIndex = state.ideas.reduce((minIdx, idea, idx, arr) =>
+                        (idea.weight || 0) < (arr[minIdx].weight || 0) ? idx : minIdx, 0);
+                      state.ideas.splice(minIndex, 1);
+                    }
                     state.ideas.push(newIdea);
                     pendingIdeas.push(newIdea);
                     markParticipantContribution(socket.id, authorName);
@@ -965,6 +977,11 @@ async function startServer() {
         targetPosition: null // Will be updated after embedding
       };
       
+      if (state.ideas.length >= MAX_IDEAS) {
+        const minIndex = state.ideas.reduce((minIdx, idea, idx, arr) =>
+          (idea.weight || 0) < (arr[minIdx].weight || 0) ? idx : minIdx, 0);
+        state.ideas.splice(minIndex, 1);
+      }
       state.ideas.push(newIdea);
       pendingIdeas.push(newIdea);
       markParticipantContribution(socket.id, newIdea.authorName);
