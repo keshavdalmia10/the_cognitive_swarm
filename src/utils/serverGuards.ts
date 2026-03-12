@@ -18,3 +18,29 @@ export interface ParticipantRecord {
 export function isAdmin(participant: ParticipantRecord | null | undefined): boolean {
   return participant?.role === 'admin';
 }
+
+export const INITIAL_CREDITS = 100;
+
+export function computeQuadraticCost(currentVotes: number, newVotes: number): number {
+  return (newVotes * newVotes) - (currentVotes * currentVotes);
+}
+
+export interface VoteValidation {
+  currentVotes: number;
+  credits: number;
+  delta: number;
+}
+
+export interface VoteResult {
+  allowed: boolean;
+  newVotes: number;
+  cost: number;
+}
+
+export function validateVote({ currentVotes, credits, delta }: VoteValidation): VoteResult {
+  const newVotes = currentVotes + delta;
+  if (newVotes < 0) return { allowed: false, newVotes: currentVotes, cost: 0 };
+  const cost = computeQuadraticCost(currentVotes, newVotes);
+  if (credits - cost < 0) return { allowed: false, newVotes: currentVotes, cost: 0 };
+  return { allowed: true, newVotes, cost };
+}

@@ -15,7 +15,7 @@ import {
 } from "./src/utils/swarmPolicy.ts";
 import { buildFallbackArtifact, getDiagramLabel, inferDiagramType } from "./src/utils/artifactPolicy.ts";
 import type { ArtifactDiagramType, ArtifactIdea } from "./src/utils/artifactPolicy.ts";
-import { isAdmin, isValidPhase } from './src/utils/serverGuards.ts';
+import { isAdmin, isValidPhase, INITIAL_CREDITS, validateVote } from './src/utils/serverGuards.ts';
 
 dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
@@ -97,6 +97,8 @@ async function startServer() {
     joinedAt: number;
     contributionCount: number;
     lastContributionAt: number | null;
+    credits: number;
+    votes: Record<string, number>;
   }>();
 
   let lastIdeaTime = Date.now();
@@ -122,6 +124,8 @@ async function startServer() {
       joinedAt: existing?.joinedAt ?? now,
       contributionCount: existing?.contributionCount ?? 0,
       lastContributionAt: existing?.lastContributionAt ?? null,
+      credits: existing?.credits ?? INITIAL_CREDITS,
+      votes: existing?.votes ?? {},
     };
 
     participants.set(socketId, participant);
@@ -139,6 +143,8 @@ async function startServer() {
       joinedAt: existing?.joinedAt ?? now,
       contributionCount: (existing?.contributionCount ?? 0) + 1,
       lastContributionAt: now,
+      credits: existing?.credits ?? INITIAL_CREDITS,
+      votes: existing?.votes ?? {},
     };
 
     participants.set(socketId, participant);
@@ -971,23 +977,36 @@ async function startServer() {
       }
     });
 
-    // Consensus Mediator Task: Idea Voting
+    // Consensus Mediator Task: Idea Voting (server-validated quadratic cost)
     socket.on("update_idea_weight", (data: { ideaId: string, weightChange: number }) => {
+      const participant = participants.get(socket.id);
+      if (!participant) return;
       const idea = state.ideas.find(i => i.id === data.ideaId);
-      if (idea) {
-        idea.weight = (idea.weight || 0) + data.weightChange;
-        // Prevent negative weights
-        if (idea.weight < 0) idea.weight = 0;
-        
-        const existingUpdateIndex = pendingUpdates.findIndex(u => u.id === data.ideaId);
-        if (existingUpdateIndex >= 0) {
-          pendingUpdates[existingUpdateIndex] = idea;
-        } else {
-          pendingUpdates.push(idea);
-        }
-        
-        io.emit('idea_weight_updated', { ideaId: data.ideaId, weight: idea.weight });
+      if (!idea) return;
+
+      const currentVotes = participant.votes[data.ideaId] || 0;
+      const result = validateVote({
+        currentVotes,
+        credits: participant.credits,
+        delta: data.weightChange,
+      });
+
+      if (!result.allowed) return;
+
+      participant.credits -= result.cost;
+      participant.votes[data.ideaId] = result.newVotes;
+      idea.weight = (idea.weight || 0) + data.weightChange;
+      if (idea.weight < 0) idea.weight = 0;
+
+      const existingUpdateIndex = pendingUpdates.findIndex(u => u.id === data.ideaId);
+      if (existingUpdateIndex >= 0) {
+        pendingUpdates[existingUpdateIndex] = idea;
+      } else {
+        pendingUpdates.push(idea);
       }
+
+      socket.emit('credits_updated', { credits: participant.credits, votes: participant.votes });
+      io.emit('idea_weight_updated', { ideaId: data.ideaId, weight: idea.weight });
     });
 
     // Edit Idea Task
