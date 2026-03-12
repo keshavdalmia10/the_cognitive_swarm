@@ -63,10 +63,19 @@ function projectTo3D(embedding: number[]): [number, number, number] {
   return [(x / mag) * scale, (y / mag) * scale, (z / mag) * scale];
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3001);
-  
+
   console.log("Server starting. GEMINI_API_KEY is", process.env.GEMINI_API_KEY ? "SET" : "NOT SET");
   logToFile("Server starting. GEMINI_API_KEY is " + (process.env.GEMINI_API_KEY ? "SET" : "NOT SET"));
   
@@ -293,9 +302,10 @@ async function startServer() {
       return null;
     }
 
-    const response = await getAI().models.generateContent({
-      model: 'gemini-3.1-flash-lite-preview',
-      contents: `You are evaluating a live brainstorm.
+    const response = await withTimeout(
+      getAI().models.generateContent({
+        model: 'gemini-3.1-flash-lite-preview',
+        contents: `You are evaluating a live brainstorm.
       Topic: "${state.topic}".
       Current phase: "${state.phase}".
       Existing ideas with clusters: ${JSON.stringify(state.ideas.map(i => ({
@@ -315,8 +325,11 @@ async function startServer() {
       - suggestion must be empty when shouldSpeak is false.
       - If shouldSpeak is true, suggestion must be a single direct spoken suggestion under 18 words.
       - Prefer materially different angles, not rephrasings of existing ideas.`,
-      config: { responseMimeType: "application/json" }
-    });
+        config: { responseMimeType: "application/json" }
+      }),
+      15000,
+      'findUntouchedDirection'
+    );
 
     const result = JSON.parse(response.text || "{}");
     if (!result.shouldSpeak || !result.suggestion) {
@@ -342,9 +355,10 @@ async function startServer() {
       }));
 
     try {
-      const response = await getAI().models.generateContent({
-        model: 'gemini-3.1-flash-lite-preview',
-        contents: `You are a diagram synthesis agent.
+      const response = await withTimeout(
+        getAI().models.generateContent({
+          model: 'gemini-3.1-flash-lite-preview',
+          contents: `You are a diagram synthesis agent.
         Topic: "${topic}".
         Chosen diagram type: "${diagramType}" (${diagramLabel}).
         Ideas: ${JSON.stringify(summarizedIdeas)}.
@@ -366,8 +380,11 @@ async function startServer() {
         - For classDiagram: create classes and relationships.
         - For mindmap: create a themed hierarchy.
         - For journey: create stages or moments of experience.`,
-        config: { responseMimeType: "application/json" }
-      });
+          config: { responseMimeType: "application/json" }
+        }),
+        20000,
+        'forgeArtifactFromTopic'
+      );
 
       const result = JSON.parse(response.text || "{}");
       const mermaid = String(result.mermaid || "").trim();
@@ -492,13 +509,17 @@ async function startServer() {
     if (state.ideas.length > 3) {
       console.log("Synthesizer Agent triggered");
       try {
-        const response = await getAI().models.generateContent({
-          model: 'gemini-3.1-flash-lite-preview',
-          contents: `Here are the current ideas: ${JSON.stringify(state.ideas.map(i => ({id: i.id, text: i.text}))) }.
+        const response = await withTimeout(
+          getAI().models.generateContent({
+            model: 'gemini-3.1-flash-lite-preview',
+            contents: `Here are the current ideas: ${JSON.stringify(state.ideas.map(i => ({id: i.id, text: i.text}))) }.
           Find 1-2 strong connections between existing ideas that aren't obvious.
           Return a JSON array of objects with 'sourceId', 'targetId', and 'reason'.`,
-          config: { responseMimeType: "application/json" }
-        });
+            config: { responseMimeType: "application/json" }
+          }),
+          15000,
+          'synthesizer'
+        );
         const edges = JSON.parse(response.text || "[]");
         if (Array.isArray(edges) && edges.length > 0) {
           edges.forEach(e => {
@@ -520,15 +541,19 @@ async function startServer() {
     if (state.ideas.length > 5) {
       console.log("Devil's Advocate Agent triggered");
       try {
-        const response = await getAI().models.generateContent({
-          model: 'gemini-3.1-flash-lite-preview',
-          contents: `The current brainstorming topic is: "${state.topic}".
+        const response = await withTimeout(
+          getAI().models.generateContent({
+            model: 'gemini-3.1-flash-lite-preview',
+            contents: `The current brainstorming topic is: "${state.topic}".
           Here are the current ideas: ${JSON.stringify(state.ideas.map(i => i.text))}.
           Act as a Devil's Advocate. Find a blind spot, contradiction, or critical flaw in the current ideas.
           Generate ONE challenging question or counter-argument. Keep it to 5-10 words.
           Return JSON with 'idea' and 'category' (use "Critique" as category).`,
-          config: { responseMimeType: "application/json" }
-        });
+            config: { responseMimeType: "application/json" }
+          }),
+          15000,
+          'devilsAdvocate'
+        );
         const result = JSON.parse(response.text || "{}");
         if (result.idea) {
           const ideaId = Math.random().toString(36).substring(2, 9);
