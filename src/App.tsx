@@ -202,6 +202,7 @@ export default function App() {
     newSocket.on('error', (err: any) => {
       console.error("Server error:", err);
       setAudioError(err.message || "Unknown server error");
+      setIsForging(false);
     });
 
     newSocket.on('ideas_batch_added', (newIdeas: any[]) => {

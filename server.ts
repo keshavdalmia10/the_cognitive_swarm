@@ -477,7 +477,7 @@ async function startServer() {
         const firstChunk = chunks.find(c => c.web?.uri);
         if (firstChunk && firstChunk.web) {
           idea.url = firstChunk.web.uri;
-          idea.urlTitle = firstChunk.web.title || response.text.substring(0, 30);
+          idea.urlTitle = firstChunk.web.title || (response.text || '').substring(0, 30);
           io.emit('idea_researched', { id: idea.id, url: idea.url, urlTitle: idea.urlTitle });
         }
       }
