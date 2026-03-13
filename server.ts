@@ -956,7 +956,9 @@ async function startServer() {
       audioChunkCount++;
       audioStreamStarted = true;
       clearPendingSessionClose();
-      interruptAnchorAudio(io);
+      // Don't interrupt anchor on every chunk — it kills the user's own
+      // Gemini response playback. Anchor is already interrupted when
+      // the audio session starts (start_audio_session handler).
       if (audioChunkCount % 10 === 0) {
         logToFile(`Received 10 audio chunks from ${socket.id}`);
       }

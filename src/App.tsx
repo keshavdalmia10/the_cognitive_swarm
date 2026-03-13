@@ -71,7 +71,9 @@ export default function App() {
   const stopSimulationRef = useRef<(() => void) | null>(null);
   const audioQueueRef = useRef<AudioBuffer[]>([]);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const anchorSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const nextPlayTimeRef = useRef<number>(0);
+  const anchorNextPlayTimeRef = useRef<number>(0);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoIntervalRef = useRef<number | null>(null);
@@ -95,7 +97,7 @@ export default function App() {
     return playbackAudioContextRef.current;
   };
 
-  const playGeminiAudioChunk = async (chunk: AudioChunkPayload) => {
+  const playGeminiAudioChunk = async (chunk: AudioChunkPayload, target: 'personal' | 'anchor' = 'personal') => {
     const ctx = await ensurePlaybackAudioContext();
     if (!ctx) return;
 
@@ -123,31 +125,35 @@ export default function App() {
     source.buffer = audioBuffer;
     source.connect(ctx.destination);
 
+    const sourcesRef = target === 'anchor' ? anchorSourcesRef : activeSourcesRef;
+    const playTimeRef = target === 'anchor' ? anchorNextPlayTimeRef : nextPlayTimeRef;
+
     const currentTime = ctx.currentTime;
-    if (nextPlayTimeRef.current < currentTime) {
-      nextPlayTimeRef.current = currentTime;
+    if (playTimeRef.current < currentTime) {
+      playTimeRef.current = currentTime;
     }
 
-    source.start(nextPlayTimeRef.current);
-    nextPlayTimeRef.current += audioBuffer.duration;
+    source.start(playTimeRef.current);
+    playTimeRef.current += audioBuffer.duration;
 
-    activeSourcesRef.current.push(source);
+    sourcesRef.current.push(source);
     source.onended = () => {
-      activeSourcesRef.current = activeSourcesRef.current.filter((activeSource) => activeSource !== source);
+      sourcesRef.current = sourcesRef.current.filter((activeSource) => activeSource !== source);
     };
   };
 
   const interruptAnchorPlayback = (clearSuggestion = false) => {
     audioQueueRef.current = [];
-    activeSourcesRef.current.forEach(source => {
+    // Only stop anchor sources — leave personal Gemini response sources playing
+    anchorSourcesRef.current.forEach(source => {
       try {
         source.stop();
       } catch (e) {}
     });
-    activeSourcesRef.current = [];
+    anchorSourcesRef.current = [];
     const playbackContext = playbackAudioContextRef.current || audioContextRef.current;
     if (playbackContext) {
-      nextPlayTimeRef.current = playbackContext.currentTime;
+      anchorNextPlayTimeRef.current = playbackContext.currentTime;
     }
     if (clearSuggestion) {
       setDirectionSuggestion(null);
@@ -279,11 +285,17 @@ export default function App() {
         anchorAnnouncementIdRef.current = announcementId;
         interruptAnchorPlayback();
       }
-      await playGeminiAudioChunk({ data, mimeType });
+      await playGeminiAudioChunk({ data, mimeType }, 'anchor');
     });
 
     newSocket.on('audio_interrupted', () => {
-      interruptAnchorPlayback();
+      // Interrupt personal Gemini response audio (e.g. when server says model was interrupted)
+      activeSourcesRef.current.forEach(source => {
+        try { source.stop(); } catch (e) {}
+      });
+      activeSourcesRef.current = [];
+      const ctx = playbackAudioContextRef.current;
+      if (ctx) nextPlayTimeRef.current = ctx.currentTime;
     });
 
     newSocket.on('audio_response', async (audioChunk: AudioChunkPayload) => {
