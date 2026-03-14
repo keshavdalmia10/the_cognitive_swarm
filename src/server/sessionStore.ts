@@ -1,4 +1,4 @@
-import { FieldValue, Firestore } from "@google-cloud/firestore";
+import type { Firestore } from "@google-cloud/firestore";
 
 import { createRedisClientFromConfig, type AppRedisClient, type DeploymentConfig } from "./runtimeConfig.ts";
 import {
@@ -17,25 +17,65 @@ interface StoreStatus {
   details: string[];
 }
 
+interface SessionStoreOptions {
+  createIfMissing?: boolean;
+  firestore?: Firestore | null;
+}
+
+interface RedisReadResult {
+  exists: boolean;
+  snapshot: SessionSnapshot;
+}
+
+let firestoreModulePromise: Promise<typeof import("@google-cloud/firestore")> | null = null;
+
+async function getFirestoreModule() {
+  if (!firestoreModulePromise) {
+    firestoreModulePromise = import("@google-cloud/firestore");
+  }
+
+  return firestoreModulePromise;
+}
+
+async function createFirestoreClient() {
+  const { Firestore } = await getFirestoreModule();
+  return new Firestore();
+}
+
 export class SessionStore {
   private redisClient: AppRedisClient | null = null;
   private firestore: Firestore | null = null;
-  private snapshot = createDefaultSessionSnapshot();
+  private snapshot = createDefaultSessionSnapshot(this.config.roomId);
   private readonly mode: "memory" | "redis";
+  private readonly createIfMissing: boolean;
+  private readonly sharedFirestore: Firestore | null;
+  private readonly ownsFirestore: boolean;
+  private exists = false;
 
-  constructor(private readonly config: DeploymentConfig) {
+  constructor(
+    private readonly config: DeploymentConfig,
+    options: SessionStoreOptions = {},
+  ) {
     this.mode = config.redis ? "redis" : "memory";
+    this.createIfMissing = options.createIfMissing ?? true;
+    this.sharedFirestore = options.firestore ?? null;
+    this.ownsFirestore = !this.sharedFirestore;
   }
 
   async init() {
     if (this.config.redis) {
-      const client = createRedisClientFromConfig(this.config.redis);
+      const client = await createRedisClientFromConfig(this.config.redis);
       client.on("error", (error) => {
         console.error("Redis client error:", error);
       });
       await client.connect();
       this.redisClient = client;
-      this.snapshot = await this.readSnapshotFromRedis();
+      const redisResult = await this.readSnapshotFromRedis();
+      this.snapshot = redisResult.snapshot;
+      this.exists = redisResult.exists;
+    } else {
+      this.snapshot = createDefaultSessionSnapshot(this.config.roomId);
+      this.exists = this.createIfMissing;
     }
 
     const shouldUseFirestore =
@@ -43,21 +83,41 @@ export class SessionStore {
       Boolean(process.env.FIRESTORE_EMULATOR_HOST) ||
       Boolean(process.env.GOOGLE_CLOUD_PROJECT);
 
-    if (shouldUseFirestore && process.env.FIRESTORE_DISABLED !== "true") {
+    if (this.sharedFirestore) {
+      this.firestore = this.sharedFirestore;
+    } else if (shouldUseFirestore && process.env.FIRESTORE_DISABLED !== "true") {
       try {
-        this.firestore = new Firestore();
+        this.firestore = await createFirestoreClient();
       } catch (error) {
         console.error("Failed to initialize Firestore client:", error);
       }
     }
 
-    await this.hydrateFromDurableSnapshotIfNeeded();
+    const hydrated = await this.hydrateFromDurableSnapshotIfNeeded();
+    if (hydrated) {
+      this.exists = true;
+    }
+
+    if (!this.exists && this.createIfMissing) {
+      this.snapshot = createDefaultSessionSnapshot(this.config.roomId);
+      this.exists = true;
+      await this.writeSnapshot(this.snapshot);
+      await this.persistSnapshot(this.snapshot);
+    }
   }
 
   async close() {
     if (this.redisClient?.isOpen) {
       await this.redisClient.quit();
     }
+  }
+
+  existsInStore() {
+    return this.exists;
+  }
+
+  getRoomCode() {
+    return this.config.roomId;
   }
 
   getRedisClient() {
@@ -95,16 +155,25 @@ export class SessionStore {
       return cloneSessionSnapshot(this.snapshot);
     }
 
-    this.snapshot = await this.readSnapshotFromRedis();
+    const redisResult = await this.readSnapshotFromRedis();
+    this.snapshot = redisResult.snapshot;
+    this.exists = redisResult.exists;
     return cloneSessionSnapshot(this.snapshot);
   }
 
   async mutate(mutator: Mutator): Promise<SessionSnapshot> {
+    if (!this.exists && !this.createIfMissing) {
+      throw new Error(`Room ${this.config.roomId} does not exist.`);
+    }
+
     if (!this.redisClient) {
       const nextSnapshot = cloneSessionSnapshot(this.snapshot);
       await mutator(nextSnapshot);
-      nextSnapshot.metadata.updatedAt = Date.now();
+      const now = Date.now();
+      nextSnapshot.metadata.updatedAt = now;
+      nextSnapshot.room.updatedAt = now;
       this.snapshot = nextSnapshot;
+      this.exists = true;
       await this.persistSnapshot(nextSnapshot);
       return cloneSessionSnapshot(nextSnapshot);
     }
@@ -112,24 +181,34 @@ export class SessionStore {
     const stateKey = this.getStateKey();
     const participantsKey = this.getParticipantsKey();
     const metadataKey = this.getMetadataKey();
+    const roomKey = this.getRoomKey();
 
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      await this.redisClient.watch([stateKey, participantsKey, metadataKey]);
+      await this.redisClient.watch([stateKey, participantsKey, metadataKey, roomKey]);
 
       const currentSnapshot = await this.readSnapshotFromRedis();
-      const nextSnapshot = cloneSessionSnapshot(currentSnapshot);
+      if (!currentSnapshot.exists && !this.createIfMissing) {
+        await this.redisClient.unwatch();
+        throw new Error(`Room ${this.config.roomId} does not exist.`);
+      }
+
+      const nextSnapshot = cloneSessionSnapshot(currentSnapshot.snapshot);
       await mutator(nextSnapshot);
-      nextSnapshot.metadata.updatedAt = Date.now();
+      const now = Date.now();
+      nextSnapshot.metadata.updatedAt = now;
+      nextSnapshot.room.updatedAt = now;
 
       const result = await this.redisClient
         .multi()
         .set(stateKey, JSON.stringify(nextSnapshot.state))
         .set(participantsKey, JSON.stringify(nextSnapshot.participants))
         .set(metadataKey, JSON.stringify(nextSnapshot.metadata))
+        .set(roomKey, JSON.stringify(nextSnapshot.room))
         .exec();
 
       if (result) {
         this.snapshot = nextSnapshot;
+        this.exists = true;
         await this.persistSnapshot(nextSnapshot);
         return cloneSessionSnapshot(nextSnapshot);
       }
@@ -146,30 +225,38 @@ export class SessionStore {
 
   private async hydrateFromDurableSnapshotIfNeeded() {
     const hasActiveState =
+      this.exists ||
       this.snapshot.state.ideas.length > 0 ||
       Object.keys(this.snapshot.participants).length > 0 ||
       Boolean(this.snapshot.state.topic);
 
     if (hasActiveState || !this.firestore) {
-      return;
+      return false;
     }
 
     const storedSnapshot = await this.loadDurableSnapshot();
     if (!storedSnapshot) {
-      await this.persistSnapshot(this.snapshot);
-      return;
+      return false;
     }
 
     this.snapshot = storedSnapshot;
+    if (this.redisClient) {
+      await this.writeSnapshot(storedSnapshot);
+    }
+    return true;
+  }
+
+  private async writeSnapshot(snapshot: SessionSnapshot) {
     if (!this.redisClient) {
       return;
     }
 
     await this.redisClient
       .multi()
-      .set(this.getStateKey(), JSON.stringify(storedSnapshot.state))
-      .set(this.getParticipantsKey(), JSON.stringify(storedSnapshot.participants))
-      .set(this.getMetadataKey(), JSON.stringify(storedSnapshot.metadata))
+      .set(this.getStateKey(), JSON.stringify(snapshot.state))
+      .set(this.getParticipantsKey(), JSON.stringify(snapshot.participants))
+      .set(this.getMetadataKey(), JSON.stringify(snapshot.metadata))
+      .set(this.getRoomKey(), JSON.stringify(snapshot.room))
       .exec();
   }
 
@@ -178,9 +265,13 @@ export class SessionStore {
       return;
     }
 
+    const { FieldValue } = await getFirestoreModule();
+
     await this.firestore.collection(this.config.fireStoreCollection).doc(this.config.roomId).set(
       {
         appEnv: this.config.appEnv,
+        roomCode: this.config.roomId,
+        status: snapshot.room.status,
         snapshot,
         updatedAt: FieldValue.serverTimestamp(),
       },
@@ -200,40 +291,45 @@ export class SessionStore {
 
     const data = document.data();
     const snapshot = data?.snapshot as SessionSnapshot | undefined;
-    if (!snapshot?.state || !snapshot?.participants || !snapshot?.metadata) {
+    if (!snapshot?.state || !snapshot?.participants || !snapshot?.metadata || !snapshot?.room) {
       return null;
     }
 
     return snapshot;
   }
 
-  private async readSnapshotFromRedis(): Promise<SessionSnapshot> {
+  private async readSnapshotFromRedis(): Promise<RedisReadResult> {
     if (!this.redisClient) {
-      return cloneSessionSnapshot(this.snapshot);
+      return {
+        exists: this.exists,
+        snapshot: cloneSessionSnapshot(this.snapshot),
+      };
     }
 
     const values = await this.redisClient.mGet([
       this.getStateKey(),
       this.getParticipantsKey(),
       this.getMetadataKey(),
+      this.getRoomKey(),
     ]);
 
-    const [stateRaw, participantsRaw, metadataRaw] = values as Array<string | null>;
+    const [stateRaw, participantsRaw, metadataRaw, roomRaw] = values as Array<string | null>;
     if (!stateRaw || !participantsRaw || !metadataRaw) {
-      const emptySnapshot = createDefaultSessionSnapshot();
-      await this.redisClient
-        .multi()
-        .set(this.getStateKey(), JSON.stringify(emptySnapshot.state))
-        .set(this.getParticipantsKey(), JSON.stringify(emptySnapshot.participants))
-        .set(this.getMetadataKey(), JSON.stringify(emptySnapshot.metadata))
-        .exec();
-      return emptySnapshot;
+      return {
+        exists: false,
+        snapshot: createDefaultSessionSnapshot(this.config.roomId),
+      };
     }
 
+    const snapshot = createDefaultSessionSnapshot(this.config.roomId);
+    snapshot.state = JSON.parse(stateRaw);
+    snapshot.participants = JSON.parse(participantsRaw) as Record<string, SessionParticipant>;
+    snapshot.metadata = JSON.parse(metadataRaw);
+    snapshot.room = roomRaw ? JSON.parse(roomRaw) : snapshot.room;
+
     return {
-      state: JSON.parse(stateRaw),
-      participants: JSON.parse(participantsRaw) as Record<string, SessionParticipant>,
-      metadata: JSON.parse(metadataRaw),
+      exists: true,
+      snapshot,
     };
   }
 
@@ -251,5 +347,9 @@ export class SessionStore {
 
   private getMetadataKey() {
     return `${this.getBaseKey()}:metadata`;
+  }
+
+  private getRoomKey() {
+    return `${this.getBaseKey()}:room`;
   }
 }

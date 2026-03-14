@@ -18,6 +18,32 @@ type AudioChunkPayload =
       mimeType?: string | null;
     };
 
+type UserRole = 'admin' | 'participant';
+type EntryMode = 'admin' | 'participant';
+
+interface ActiveRoomState {
+  code: string;
+  adminUserName: string;
+  status: 'active' | 'closed';
+  participantCount: number;
+}
+
+interface StateSyncPayload {
+  room: ActiveRoomState;
+  state: {
+    topic: string;
+    phase: 'divergent' | 'convergent' | 'forging';
+    ideas: any[];
+    edges: any[];
+    artifactData: ArtifactData | null;
+  };
+  currentUser: {
+    userName: string;
+    role: UserRole;
+    isAdmin: boolean;
+  };
+}
+
 function decodeBase64ToBytes(base64Audio: string) {
   const binaryString = window.atob(base64Audio);
   const bytes = new Uint8Array(binaryString.length);
@@ -34,13 +60,19 @@ function parseSampleRateFromMimeType(mimeType?: string | null, fallback = DEFAUL
 }
 
 export default function App() {
+  const [entryMode, setEntryMode] = useState<EntryMode>('admin');
   const [userName, setUserName] = useState('');
   const userNameRef = useRef('');
   useEffect(() => { userNameRef.current = userName; }, [userName]);
-  const [role, setRole] = useState<'admin' | 'participant' | null>(null);
-  const roleRef = useRef<'admin' | 'participant' | null>(null);
+  const [role, setRole] = useState<UserRole | null>(null);
+  const roleRef = useRef<UserRole | null>(null);
   useEffect(() => { roleRef.current = role; }, [role]);
   const [socket, setSocket] = useState<Socket | null>(null);
+  const [activeRoom, setActiveRoom] = useState<ActiveRoomState | null>(null);
+  const [roomCodeInput, setRoomCodeInput] = useState('');
+  const [roomError, setRoomError] = useState<string | null>(null);
+  const [roomNotice, setRoomNotice] = useState<string | null>(null);
+  const [isJoiningRoom, setIsJoiningRoom] = useState(false);
   const [phase, setPhase] = useState<'divergent' | 'convergent' | 'forging'>('divergent');
   const [topic, setTopic] = useState<string>('');
   const [isEditingTopic, setIsEditingTopic] = useState(false);
@@ -164,13 +196,63 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    if (!socket || !role || !userName.trim()) return;
-    socket.emit('register_participant', {
-      userName: userName.trim(),
-      role,
-    });
-  }, [socket, role, userName]);
+  const stopAudioCapture = () => {
+    setIsRecording(false);
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(t => t.stop());
+      mediaStreamRef.current = null;
+    }
+    if (workletNodeRef.current) {
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
+    }
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      void audioContextRef.current.close();
+    }
+    audioContextRef.current = null;
+  };
+
+  const stopVideoCapture = () => {
+    setIsCameraActive(false);
+    if (videoStreamRef.current) {
+      videoStreamRef.current.getTracks().forEach(t => t.stop());
+      videoStreamRef.current = null;
+    }
+    if (videoIntervalRef.current) {
+      window.clearInterval(videoIntervalRef.current);
+      videoIntervalRef.current = null;
+    }
+  };
+
+  const resetRoomState = (message?: string) => {
+    stopAudioCapture();
+    stopVideoCapture();
+    interruptAnchorPlayback(true);
+    if (stopSimulationRef.current) {
+      stopSimulationRef.current();
+      stopSimulationRef.current = null;
+    }
+    setIsSimulating(false);
+    setActiveRoom(null);
+    setRole(null);
+    setPhase('divergent');
+    setTopic('');
+    setIdeas([]);
+    setSwarmEdges([]);
+    setCredits(100);
+    setUserVotes({});
+    setArtifact(null);
+    setAudioError(null);
+    setDirectionSuggestion(null);
+    setManualIdea('');
+    setSelectedIdeaId(null);
+    setForgeError(null);
+    setIsForging(false);
+    setIsEditingTopic(false);
+    if (message) {
+      setRoomNotice(message);
+    }
+  };
 
   const handleVote = (ideaId: string, change: number) => {
     socket?.emit('update_idea_weight', { ideaId, weightChange: change });
@@ -195,12 +277,66 @@ export default function App() {
     const newSocket = io();
     setSocket(newSocket);
 
-    newSocket.on('state_sync', (state) => {
-      setTopic(state.topic || '');
-      setPhase(state.phase);
-      setIdeas(state.ideas);
-      setSwarmEdges(state.edges || []);
-      setArtifact(state.artifactData || null);
+    newSocket.on('state_sync', (payload: StateSyncPayload) => {
+      setActiveRoom(payload.room);
+      setUserName(payload.currentUser.userName || userNameRef.current);
+      setRole(payload.currentUser.role);
+      setTopic(payload.state.topic || '');
+      setPhase(payload.state.phase);
+      setIdeas(payload.state.ideas);
+      setSwarmEdges(payload.state.edges || []);
+      setArtifact(payload.state.artifactData || null);
+      setRoomCodeInput(payload.room.code);
+      setRoomError(null);
+      setIsJoiningRoom(false);
+    });
+
+    newSocket.on('room_created', ({ roomCode, adminUserName }: { roomCode: string; adminUserName: string }) => {
+      setEntryMode('admin');
+      setRoomCodeInput(roomCode);
+      setRoomNotice(`Room ${roomCode} created. Share this code with participants.`);
+      setRoomError(null);
+      setRole('admin');
+      setActiveRoom((previous) => previous || {
+        code: roomCode,
+        adminUserName,
+        status: 'active',
+        participantCount: 1,
+      });
+    });
+
+    newSocket.on('room_joined', ({ roomCode, adminUserName }: { roomCode: string; adminUserName: string }) => {
+      setEntryMode('participant');
+      setRoomCodeInput(roomCode);
+      setRoomNotice(`Joined room ${roomCode}.`);
+      setRoomError(null);
+      setRole('participant');
+      setActiveRoom((previous) => previous || {
+        code: roomCode,
+        adminUserName,
+        status: 'active',
+        participantCount: 0,
+      });
+    });
+
+    newSocket.on('room_error', ({ message }: { message: string }) => {
+      setRoomError(message || 'Unable to join room.');
+      setRoomNotice(null);
+      setIsJoiningRoom(false);
+    });
+
+    newSocket.on('room_left', ({ roomCode }: { roomCode: string }) => {
+      setRoomCodeInput(roomCode || '');
+      setRoomError(null);
+      setIsJoiningRoom(false);
+      resetRoomState('You left the room.');
+    });
+
+    newSocket.on('room_closed', ({ roomCode, message }: { roomCode: string; message?: string }) => {
+      setRoomCodeInput(roomCode || '');
+      setRoomError(null);
+      setIsJoiningRoom(false);
+      resetRoomState(message || 'This room is closed.');
     });
 
     newSocket.on('topic_updated', (newTopic) => {
@@ -215,6 +351,10 @@ export default function App() {
 
     newSocket.on('ideas_batch_added', (newIdeas: any[]) => {
       setIdeas((prev) => [...prev, ...newIdeas]);
+      const newestIdea = newIdeas[newIdeas.length - 1];
+      if (newestIdea?.id) {
+        setSelectedIdeaId(newestIdea.id);
+      }
     });
 
     newSocket.on('ideas_batch_updated', (updatedIdeas: any[]) => {
@@ -305,17 +445,7 @@ export default function App() {
     });
 
     newSocket.on('audio_session_closed', () => {
-      setIsRecording(false);
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach(t => t.stop());
-      }
-      if (workletNodeRef.current) {
-        workletNodeRef.current.disconnect();
-      }
-      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close();
-        audioContextRef.current = null;
-      }
+      stopAudioCapture();
       // Do NOT close playbackAudioContextRef here — Gemini may still be
       // streaming audio responses that need to finish playing back.
       // Playback context is only cleaned up on component unmount.
@@ -325,22 +455,8 @@ export default function App() {
       if (suggestionTimeoutRef.current) {
         window.clearTimeout(suggestionTimeoutRef.current);
       }
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach(t => t.stop());
-      }
-      if (videoStreamRef.current) {
-        videoStreamRef.current.getTracks().forEach(t => t.stop());
-      }
-      if (videoIntervalRef.current) {
-        window.clearInterval(videoIntervalRef.current);
-      }
-      if (workletNodeRef.current) {
-        workletNodeRef.current.disconnect();
-      }
-      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close();
-        audioContextRef.current = null;
-      }
+      stopAudioCapture();
+      stopVideoCapture();
       if (playbackAudioContextRef.current && playbackAudioContextRef.current.state !== 'closed') {
         playbackAudioContextRef.current.close();
         playbackAudioContextRef.current = null;
@@ -358,17 +474,7 @@ export default function App() {
         await new Promise((resolve) => window.setTimeout(resolve, 30));
       }
       socket?.emit('stop_audio_session');
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach(t => t.stop());
-      }
-      if (workletNodeRef.current) {
-        workletNodeRef.current.disconnect();
-      }
-      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close();
-        audioContextRef.current = null;
-      }
-      setIsRecording(false);
+      stopAudioCapture();
       return;
     }
 
@@ -416,7 +522,7 @@ export default function App() {
       silentGain.connect(audioContext.destination);
 
       console.log("Emitting start_audio_session");
-      socket?.emit('start_audio_session', { topic, userName: userNameRef.current });
+      socket?.emit('start_audio_session');
 
       let chunkCount = 0;
       workletNode.port.onmessage = (e) => {
@@ -445,14 +551,7 @@ export default function App() {
   const toggleCamera = async () => {
     if (isCameraActive) {
       socket?.emit('stop_video_session');
-      if (videoStreamRef.current) {
-        videoStreamRef.current.getTracks().forEach(t => t.stop());
-      }
-      if (videoIntervalRef.current) {
-        window.clearInterval(videoIntervalRef.current);
-        videoIntervalRef.current = null;
-      }
-      setIsCameraActive(false);
+      stopVideoCapture();
       return;
     }
 
@@ -467,7 +566,7 @@ export default function App() {
         videoRef.current.srcObject = stream;
       }
 
-      socket?.emit('start_video_session', { topic, userName: userNameRef.current });
+      socket?.emit('start_video_session');
 
       videoIntervalRef.current = window.setInterval(() => {
         if (videoRef.current && canvasRef.current) {
@@ -488,6 +587,11 @@ export default function App() {
   };
 
   const toggleSimulation = () => {
+    if (!activeRoom?.code) {
+      setRoomError('Create a room before starting the simulation.');
+      return;
+    }
+
     if (isSimulating) {
       if (stopSimulationRef.current) {
         stopSimulationRef.current();
@@ -495,13 +599,58 @@ export default function App() {
       }
       setIsSimulating(false);
     } else {
-      stopSimulationRef.current = startSimulation(5); // Spawn 5 virtual clients
+      stopSimulationRef.current = startSimulation(5, activeRoom.code);
       setIsSimulating(true);
     }
   };
 
   const [forgeError, setForgeError] = useState<string | null>(null);
   const [isForging, setIsForging] = useState(false);
+  const activeUserName = userName.trim() || 'Anonymous Node';
+  const activeRoleLabel = role === 'admin' ? 'Administrator' : 'Participant';
+  const activeRoomCode = activeRoom?.code || '';
+  const activeAdminName = activeRoom?.adminUserName || '';
+
+  const handleCreateRoom = () => {
+    if (!socket || !userName.trim() || !topic.trim()) {
+      setRoomError('Display name and topic are required.');
+      return;
+    }
+
+    setRoomError(null);
+    setRoomNotice(null);
+    setIsJoiningRoom(true);
+    socket.emit('create_room', { userName: userName.trim(), topic: topic.trim() });
+  };
+
+  const handleJoinRoom = () => {
+    if (!socket || !userName.trim() || !roomCodeInput.trim()) {
+      setRoomError('Display name and room code are required.');
+      return;
+    }
+
+    setRoomError(null);
+    setRoomNotice(null);
+    setIsJoiningRoom(true);
+    socket.emit('join_room', { userName: userName.trim(), roomCode: roomCodeInput.trim() });
+  };
+
+  const handleExitRoom = () => {
+    if (!socket || !role) return;
+    setRoomError(null);
+    setRoomNotice(null);
+    if (role === 'admin') {
+      socket.emit('close_room');
+    } else {
+      socket.emit('leave_room');
+    }
+  };
+
+  const copyRoomCode = async () => {
+    if (!activeRoomCode || !navigator.clipboard) return;
+    await navigator.clipboard.writeText(activeRoomCode);
+    setRoomNotice(`Copied room code ${activeRoomCode}.`);
+  };
 
   const requestSuggestion = () => {
     void ensurePlaybackAudioContext();
@@ -523,26 +672,34 @@ export default function App() {
   if (!role) {
     return (
       <div className="min-h-screen bg-[#050505] text-white font-sans flex items-center justify-center overflow-hidden">
-        <div className="max-w-md w-full p-8 bg-[#0a0a0a] border border-white/10 rounded-2xl shadow-2xl text-center">
+        <div className="max-w-lg w-full p-8 bg-[#0a0a0a] border border-white/10 rounded-2xl shadow-2xl text-center">
           <BrainCircuit className="w-16 h-16 text-[#00FF00] mx-auto mb-6" />
           <h1 className="text-3xl font-bold mb-2 uppercase tracking-tight" style={{ fontFamily: "'Anton', sans-serif" }}>
             The Cognitive Swarm
           </h1>
           <p className="text-white/60 font-mono text-sm mb-8">
-            Select your role to join the session.
+            Create a room as the admin, or join one with a room code.
           </p>
-          
+
+          <div className="mb-6 flex bg-white/5 rounded-full p-1">
+            {(['admin', 'participant'] as EntryMode[]).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => {
+                  setEntryMode(mode);
+                  setRoomError(null);
+                  setRoomNotice(null);
+                }}
+                className={`flex-1 rounded-full px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition-colors ${
+                  entryMode === mode ? 'bg-[#00FF00] text-black' : 'text-white/60 hover:text-white'
+                }`}
+              >
+                {mode === 'admin' ? 'Create Room' : 'Join Room'}
+              </button>
+            ))}
+          </div>
+
           <div className="mb-6 text-left space-y-4">
-            <div>
-              <label className="block text-xs font-mono text-white/50 mb-2 uppercase tracking-wider">Brainstorming Topic</label>
-              <input 
-                type="text" 
-                value={topic}
-                onChange={(e) => setTopic(e.target.value)}
-                placeholder="Enter topic..."
-                className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-[#00FF00]/50 transition-colors"
-              />
-            </div>
             <div>
               <label className="block text-xs font-mono text-white/50 mb-2 uppercase tracking-wider">Display Name</label>
               <input 
@@ -552,47 +709,80 @@ export default function App() {
                 placeholder="Enter your name..."
                 className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-[#00FF00]/50 transition-colors"
               />
+              <div className="mt-2 text-xs font-mono text-white/40">
+                Joining as <span className="text-[#00FF00]">{activeUserName}</span>
+              </div>
             </div>
+
+            {entryMode === 'admin' ? (
+              <div>
+                <label className="block text-xs font-mono text-white/50 mb-2 uppercase tracking-wider">Brainstorming Topic</label>
+                <input 
+                  type="text" 
+                  value={topic}
+                  onChange={(e) => setTopic(e.target.value)}
+                  placeholder="Enter topic..."
+                  className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-[#00FF00]/50 transition-colors"
+                />
+              </div>
+            ) : (
+              <div>
+                <label className="block text-xs font-mono text-white/50 mb-2 uppercase tracking-wider">Room Code</label>
+                <input 
+                  type="text" 
+                  value={roomCodeInput}
+                  onChange={(e) => setRoomCodeInput(e.target.value.toUpperCase())}
+                  placeholder="Enter room code..."
+                  maxLength={6}
+                  className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white tracking-[0.3em] uppercase focus:outline-none focus:border-[#00FF00]/50 transition-colors"
+                />
+              </div>
+            )}
           </div>
+
+          {(roomError || roomNotice) && (
+            <div className={`mb-6 rounded-xl border px-4 py-3 text-left text-sm font-mono ${
+              roomError ? 'border-red-500/40 bg-red-500/10 text-red-300' : 'border-[#00FF00]/30 bg-[#00FF00]/10 text-[#9dff9d]'
+            }`}>
+              {roomError || roomNotice}
+            </div>
+          )}
 
           <div className="space-y-4">
             <button
               onClick={() => {
                 void ensurePlaybackAudioContext();
-                setRole('admin');
-                socket?.emit('set_topic', topic);
+                if (entryMode === 'admin') {
+                  handleCreateRoom();
+                } else {
+                  handleJoinRoom();
+                }
               }}
-              disabled={!userName.trim() || !topic.trim()}
-              className={`w-full py-4 px-6 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-all flex items-center justify-between group ${(!userName.trim() || !topic.trim()) ? 'opacity-50 cursor-not-allowed' : ''}`}
+              disabled={isJoiningRoom || !userName.trim() || (entryMode === 'admin' ? !topic.trim() : !roomCodeInput.trim())}
+              className={`w-full py-4 px-6 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-all flex items-center justify-between group ${
+                (isJoiningRoom || !userName.trim() || (entryMode === 'admin' ? !topic.trim() : !roomCodeInput.trim())) ? 'opacity-50 cursor-not-allowed' : ''
+              }`}
             >
               <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-[#00FF00]/20 flex items-center justify-center group-hover:bg-[#00FF00]/30 transition-colors">
-                  <Zap className="w-5 h-5 text-[#00FF00]" />
-                </div>
+                {entryMode === 'admin' ? (
+                  <div className="w-10 h-10 rounded-full bg-[#00FF00]/20 flex items-center justify-center group-hover:bg-[#00FF00]/30 transition-colors">
+                    <Zap className="w-5 h-5 text-[#00FF00]" />
+                  </div>
+                ) : (
+                  <div className="w-10 h-10 rounded-full bg-blue-500/20 flex items-center justify-center group-hover:bg-blue-500/30 transition-colors">
+                    <Users className="w-5 h-5 text-blue-400" />
+                  </div>
+                )}
                 <div className="text-left">
-                  <div className="font-bold text-lg">Administrator</div>
-                  <div className="text-xs text-white/50 font-mono">Manage phases & simulate</div>
+                  <div className="font-bold text-lg">{entryMode === 'admin' ? 'Create Room' : 'Join Room'}</div>
+                  <div className="text-xs text-white/50 font-mono">
+                    {entryMode === 'admin' ? 'Generate a shareable room code' : 'Enter an admin-generated room code'}
+                  </div>
                 </div>
               </div>
-            </button>
-
-            <button
-              onClick={() => {
-                void ensurePlaybackAudioContext();
-                setRole('participant');
-              }}
-              disabled={!userName.trim() || !topic.trim()}
-              className={`w-full py-4 px-6 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-all flex items-center justify-between group ${(!userName.trim() || !topic.trim()) ? 'opacity-50 cursor-not-allowed' : ''}`}
-            >
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-blue-500/20 flex items-center justify-center group-hover:bg-blue-500/30 transition-colors">
-                  <Users className="w-5 h-5 text-blue-400" />
-                </div>
-                <div className="text-left">
-                  <div className="font-bold text-lg">Participant</div>
-                  <div className="text-xs text-white/50 font-mono">Brainstorm & vote</div>
-                </div>
-              </div>
+              <span className="text-xs font-mono uppercase tracking-[0.2em] text-white/40">
+                {isJoiningRoom ? 'Working...' : entryMode === 'admin' ? 'Host' : 'Enter'}
+              </span>
             </button>
           </div>
         </div>
@@ -643,14 +833,43 @@ export default function App() {
                 )}
               </div>
             ) : (
-              <div className="text-sm text-[#00FF00] font-mono mt-1">
-                Topic: {topic}
+              <div className="mt-1 flex flex-col gap-1">
+                <div className="text-sm text-[#00FF00] font-mono">
+                  Topic: {topic}
+                </div>
+                <div className="text-[11px] text-white/45 font-mono uppercase tracking-[0.18em]">
+                  Host: {activeAdminName || 'Unknown'}
+                </div>
               </div>
             )}
           </div>
         </div>
         
         <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2 rounded-2xl border border-[#00FF00]/20 bg-[#00FF00]/10 px-4 py-2">
+            <div className="flex flex-col leading-tight">
+              <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-white/40">Room Code</span>
+              <span className="text-sm font-semibold tracking-[0.22em] text-[#9dff9d]">{activeRoomCode}</span>
+            </div>
+            <button
+              onClick={() => void copyRoomCode()}
+              className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[10px] font-mono uppercase tracking-[0.18em] text-white/70 hover:bg-white/10"
+            >
+              Copy
+            </button>
+          </div>
+
+          <div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-2">
+            <div className="flex h-9 w-9 items-center justify-center rounded-full bg-[#00FF00]/15 text-[#00FF00]">
+              <Users className="w-4 h-4" />
+            </div>
+            <div className="flex flex-col leading-tight">
+              <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-white/40">Active User</span>
+              <span className="text-sm font-semibold text-white">{activeUserName}</span>
+              <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-[#00FF00]">{activeRoleLabel}</span>
+            </div>
+          </div>
+
           <div className="flex bg-white/5 rounded-full p-1">
             {['divergent', 'convergent', 'forging'].map((p) => (
               <button
@@ -725,9 +944,23 @@ export default function App() {
               {isRecording ? <Mic className="w-4 h-4 animate-pulse" /> : <MicOff className="w-4 h-4" />}
               {isRecording ? 'Listening...' : 'Join Swarm'}
             </button>
+            <button
+              onClick={handleExitRoom}
+              className="flex items-center gap-2 px-4 py-2 rounded-full font-mono text-sm transition-all bg-white/5 text-white/70 hover:bg-white/10 border border-white/10"
+            >
+              {role === 'admin' ? 'End Room' : 'Leave Room'}
+            </button>
           </div>
         </div>
       </header>
+
+      {(roomError || roomNotice) && (
+        <div className={`border-b px-6 py-3 text-sm font-mono ${
+          roomError ? 'border-red-500/20 bg-red-500/10 text-red-300' : 'border-[#00FF00]/15 bg-[#00FF00]/8 text-[#9dff9d]'
+        }`}>
+          {roomError || roomNotice}
+        </div>
+      )}
 
       {/* Main Content Area */}
       <main className="flex-1 relative flex">
@@ -774,7 +1007,7 @@ export default function App() {
                           onChange={e => setManualIdea(e.target.value)}
                           onKeyDown={e => {
                             if (e.key === 'Enter' && manualIdea.trim()) {
-                              socket?.emit('add_idea', { text: manualIdea, authorName: userNameRef.current });
+                              socket?.emit('add_idea', { text: manualIdea, cluster: 'General', authorName: userNameRef.current });
                               setManualIdea('');
                             }
                           }}
@@ -784,7 +1017,7 @@ export default function App() {
                         <button 
                           onClick={() => {
                             if (manualIdea.trim()) {
-                              socket?.emit('add_idea', { text: manualIdea, authorName: userNameRef.current });
+                              socket?.emit('add_idea', { text: manualIdea, cluster: 'General', authorName: userNameRef.current });
                               setManualIdea('');
                             }
                           }}

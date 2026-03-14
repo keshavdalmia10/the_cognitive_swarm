@@ -1,5 +1,5 @@
-import React, { useMemo, useRef, useState } from 'react';
-import { Canvas } from '@react-three/fiber';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Html, Line, OrbitControls, PerspectiveCamera, Stars } from '@react-three/drei';
 import * as THREE from 'three';
 
@@ -173,6 +173,74 @@ function SwarmScene({
 }) {
   const controlsRef = useRef<any>(null);
   const graph = useMemo(() => buildGraph(ideas, edges), [ideas, edges]);
+  const selectedNode = graph.nodes.find((node) => node.id === selectedIdeaId) || null;
+
+  function CameraFocusAnimation({ focusNode }: { focusNode: any | null }) {
+    const { camera } = useThree();
+    const animationRef = useRef<{
+      start: number;
+      duration: number;
+      fromPosition: THREE.Vector3;
+      toPosition: THREE.Vector3;
+      fromTarget: THREE.Vector3;
+      toTarget: THREE.Vector3;
+    } | null>(null);
+    const lastFocusKeyRef = useRef('');
+
+    useEffect(() => {
+      const controls = controlsRef.current;
+      if (!focusNode || !controls) return;
+
+      const focusTarget = new THREE.Vector3(...focusNode.position);
+      const focusKey = `${focusNode.id}:${focusNode.position.map((value: number) => value.toFixed(2)).join(':')}`;
+      if (focusKey === lastFocusKeyRef.current) {
+        return;
+      }
+      lastFocusKeyRef.current = focusKey;
+
+      const currentTarget = controls.target.clone();
+      const currentPosition = camera.position.clone();
+      const offset = currentPosition.clone().sub(currentTarget);
+      if (offset.lengthSq() === 0) {
+        offset.set(0, 0, 24);
+      }
+
+      const desiredDistance = THREE.MathUtils.clamp(offset.length(), 10, 24);
+      const nextPosition = focusTarget.clone().add(offset.normalize().multiplyScalar(desiredDistance));
+
+      animationRef.current = {
+        start: performance.now(),
+        duration: 950,
+        fromPosition: currentPosition,
+        toPosition: nextPosition,
+        fromTarget: currentTarget,
+        toTarget: focusTarget,
+      };
+    }, [camera, focusNode]);
+
+    useFrame(() => {
+      const controls = controlsRef.current;
+      const animation = animationRef.current;
+      if (!controls || !animation) return;
+
+      const elapsed = performance.now() - animation.start;
+      const progress = Math.min(elapsed / animation.duration, 1);
+      const eased =
+        progress < 0.5
+          ? 4 * progress * progress * progress
+          : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+
+      camera.position.lerpVectors(animation.fromPosition, animation.toPosition, eased);
+      controls.target.lerpVectors(animation.fromTarget, animation.toTarget, eased);
+      controls.update();
+
+      if (progress >= 1) {
+        animationRef.current = null;
+      }
+    });
+
+    return null;
+  }
 
   return (
     <>
@@ -180,6 +248,7 @@ function SwarmScene({
       <fog attach="fog" args={['#050505', 20, 48]} />
 
       <PerspectiveCamera makeDefault position={[0, 0, 24]} fov={52} />
+      <CameraFocusAnimation focusNode={selectedNode} />
       <ambientLight intensity={0.85} />
       <directionalLight position={[10, 12, 8]} intensity={1.25} color="#e2ffe8" />
       <pointLight position={[-10, -6, -10]} intensity={1.1} color="#2dd4bf" />

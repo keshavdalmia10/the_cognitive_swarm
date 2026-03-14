@@ -1,4 +1,4 @@
-import { createClient } from "redis";
+import type { RedisClientType } from "redis";
 
 export interface RedisConnectionConfig {
   url?: string;
@@ -18,7 +18,17 @@ export interface DeploymentConfig {
   allowInMemoryState: boolean;
 }
 
-export type AppRedisClient = ReturnType<typeof createClient>;
+export type AppRedisClient = RedisClientType;
+
+let redisModulePromise: Promise<typeof import("redis")> | null = null;
+
+async function getRedisModule() {
+  if (!redisModulePromise) {
+    redisModulePromise = import("redis");
+  }
+
+  return redisModulePromise;
+}
 
 export function getRedisConnectionConfig(env: NodeJS.ProcessEnv = process.env): RedisConnectionConfig | null {
   if (env.REDIS_URL?.trim()) {
@@ -58,7 +68,9 @@ export function getDeploymentConfig(env: NodeJS.ProcessEnv = process.env): Deplo
   };
 }
 
-export function createRedisClientFromConfig(config: RedisConnectionConfig) {
+export async function createRedisClientFromConfig(config: RedisConnectionConfig): Promise<AppRedisClient> {
+  const { createClient } = await getRedisModule();
+
   if (config.url) {
     return createClient({ url: config.url });
   }

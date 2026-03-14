@@ -52,6 +52,15 @@ export interface SessionParticipant {
   votes: Record<string, number>;
 }
 
+export interface RoomMetadata {
+  code: string;
+  adminSocketId: string;
+  adminUserName: string;
+  status: "active" | "closed";
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface SessionMetadata {
   lastIdeaTime: number;
   lastDirectionSuggestionTime: number;
@@ -60,6 +69,7 @@ export interface SessionMetadata {
 }
 
 export interface SessionSnapshot {
+  room: RoomMetadata;
   state: SessionState;
   participants: Record<string, SessionParticipant>;
   metadata: SessionMetadata;
@@ -76,8 +86,20 @@ export function createDefaultSessionState(): SessionState {
   };
 }
 
-export function createDefaultSessionSnapshot(now = Date.now()): SessionSnapshot {
+export function createDefaultRoomMetadata(roomCode: string, now = Date.now()): RoomMetadata {
   return {
+    code: roomCode,
+    adminSocketId: "",
+    adminUserName: "",
+    status: "active",
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export function createDefaultSessionSnapshot(roomCode: string, now = Date.now()): SessionSnapshot {
+  return {
+    room: createDefaultRoomMetadata(roomCode, now),
     state: createDefaultSessionState(),
     participants: {},
     metadata: {

@@ -38,6 +38,8 @@ test("SessionStore supports in-memory mutation and participant cleanup", async (
   let snapshot = await store.getSnapshot();
   assert.equal(snapshot.state.topic, "Durable swarm");
   assert.equal(snapshot.participants["socket-1"]?.userName, "Alex");
+  assert.equal(snapshot.room.code, "main-room");
+  assert.equal(snapshot.room.status, "active");
 
   snapshot = await store.removeParticipant("socket-1");
   assert.equal(snapshot.participants["socket-1"], undefined);

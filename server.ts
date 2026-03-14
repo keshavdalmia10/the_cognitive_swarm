@@ -8,12 +8,14 @@ import { createAdapter } from "@socket.io/redis-adapter";
 import { Server } from "socket.io";
 import { createServer as createViteServer } from "vite";
 
+import { generateRoomCode, isValidRoomCode, normalizeRoomCode } from "./src/server/roomCode.ts";
 import { createRedisClientFromConfig, getDeploymentConfig, type AppRedisClient } from "./src/server/runtimeConfig.ts";
 import { SessionStore } from "./src/server/sessionStore.ts";
 import type {
   IdeaRecord,
   SessionParticipant,
   SessionSnapshot,
+  SessionState,
 } from "./src/server/sessionTypes.ts";
 import { buildFallbackArtifact, getDiagramLabel, inferDiagramType } from "./src/utils/artifactPolicy.ts";
 import type { ArtifactDiagramType, ArtifactIdea } from "./src/utils/artifactPolicy.ts";
@@ -29,6 +31,22 @@ import { INITIAL_CREDITS, isAdmin, isValidPhase, sanitizeIdeaInput, validateVote
 dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
 function logToFile(_msg: string) {}
+
+type UserRole = "admin" | "participant";
+type SuggestionReason = "auto" | "manual";
+
+interface RoomContext {
+  roomCode: string;
+  store: SessionStore;
+  directionSuggestionInFlight: boolean;
+  anchorLiveSessionPromise: Promise<any> | null;
+  currentAnchorAnnouncementId: number;
+  anchorResponseAnnouncementId: number;
+  synthesizerInterval: NodeJS.Timeout | null;
+  criticInterval: NodeJS.Timeout | null;
+  suggestionInterval: NodeJS.Timeout | null;
+  runtimeEnabled: boolean;
+}
 
 function emitInlineAudio(
   target: { emit: (eventName: string, payload: any) => boolean },
@@ -113,7 +131,7 @@ function upsertParticipantRecord(
   snapshot: SessionSnapshot,
   socketId: string,
   userName: string,
-  role: "admin" | "participant" = "participant",
+  role: UserRole = "participant",
 ): SessionParticipant | null {
   const cleanedName = userName.trim();
   if (!cleanedName) {
@@ -208,8 +226,6 @@ async function startServer() {
   const app = express();
   const port = Number(process.env.PORT || 3001);
   const deploymentConfig = getDeploymentConfig();
-  const sessionStore = new SessionStore(deploymentConfig);
-  await sessionStore.init();
 
   console.log("Server starting. GEMINI_API_KEY is", process.env.GEMINI_API_KEY ? "SET" : "NOT SET");
   logToFile(`Server starting. GEMINI_API_KEY is ${process.env.GEMINI_API_KEY ? "SET" : "NOT SET"}`);
@@ -224,42 +240,196 @@ async function startServer() {
 
   const shutdownClients: AppRedisClient[] = [];
   if (deploymentConfig.redis) {
-    const pubClient = createRedisClientFromConfig(deploymentConfig.redis);
+    const pubClient = await createRedisClientFromConfig(deploymentConfig.redis);
     const subClient = pubClient.duplicate();
     await Promise.all([pubClient.connect(), subClient.connect()]);
     io.adapter(createAdapter(pubClient, subClient));
     shutdownClients.push(pubClient, subClient);
   }
 
-  let directionSuggestionInFlight = false;
-  let anchorLiveSessionPromise: Promise<any> | null = null;
-  let currentAnchorAnnouncementId = 0;
-  let anchorResponseAnnouncementId = 0;
+  const roomContexts = new Map<string, RoomContext>();
 
-  function interruptAnchorAudio(targetIO: Server) {
-    currentAnchorAnnouncementId += 1;
-    targetIO.emit("anchor_audio_interrupted", {
-      announcementId: currentAnchorAnnouncementId,
-      createdAt: Date.now(),
-    });
-    return currentAnchorAnnouncementId;
+  function getLocalSocketsForRoom(roomCode: string) {
+    return Array.from(io.of("/").sockets.values()).filter((socket) => socket.data.roomCode === roomCode);
   }
 
-  function startAnchorSessionIfNeeded(targetIO: Server) {
-    if (anchorLiveSessionPromise) return anchorLiveSessionPromise;
+  function clearSocketRoom(socket: any) {
+    socket.data.roomCode = undefined;
+    socket.data.role = undefined;
+    socket.data.userName = undefined;
+  }
+
+  async function cleanupRoomContextIfUnused(roomCode: string) {
+    const roomContext = roomContexts.get(roomCode);
+    if (!roomContext) return;
+    if (getLocalSocketsForRoom(roomCode).length > 0) return;
+
+    if (roomContext.synthesizerInterval) clearInterval(roomContext.synthesizerInterval);
+    if (roomContext.criticInterval) clearInterval(roomContext.criticInterval);
+    if (roomContext.suggestionInterval) clearInterval(roomContext.suggestionInterval);
+    roomContext.synthesizerInterval = null;
+    roomContext.criticInterval = null;
+    roomContext.suggestionInterval = null;
+    roomContext.runtimeEnabled = false;
+
+    if (roomContext.anchorLiveSessionPromise) {
+      await roomContext.anchorLiveSessionPromise.then((session) => session.close()).catch(() => undefined);
+      roomContext.anchorLiveSessionPromise = null;
+    }
+
+    await roomContext.store.close();
+    roomContexts.delete(roomCode);
+  }
+
+  async function getRoomContext(roomCode: string, createIfMissing = false) {
+    const normalizedRoomCode = normalizeRoomCode(roomCode);
+    const existing = roomContexts.get(normalizedRoomCode);
+    if (existing) {
+      return existing;
+    }
+
+    const store = new SessionStore(
+      {
+        ...deploymentConfig,
+        roomId: normalizedRoomCode,
+      },
+      { createIfMissing },
+    );
+    await store.init();
+
+    if (!store.existsInStore()) {
+      await store.close();
+      return null;
+    }
+
+    const roomContext: RoomContext = {
+      roomCode: normalizedRoomCode,
+      store,
+      directionSuggestionInFlight: false,
+      anchorLiveSessionPromise: null,
+      currentAnchorAnnouncementId: 0,
+      anchorResponseAnnouncementId: 0,
+      synthesizerInterval: null,
+      criticInterval: null,
+      suggestionInterval: null,
+      runtimeEnabled: false,
+    };
+    roomContexts.set(normalizedRoomCode, roomContext);
+    return roomContext;
+  }
+
+  async function roomCodeExists(roomCode: string) {
+    const probeStore = new SessionStore(
+      {
+        ...deploymentConfig,
+        roomId: normalizeRoomCode(roomCode),
+      },
+      { createIfMissing: false },
+    );
+    await probeStore.init();
+    const exists = probeStore.existsInStore();
+    await probeStore.close();
+    return exists;
+  }
+
+  async function allocateRoomCode() {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const roomCode = generateRoomCode();
+      if (roomContexts.has(roomCode)) {
+        continue;
+      }
+      if (!(await roomCodeExists(roomCode))) {
+        return roomCode;
+      }
+    }
+
+    throw new Error("Unable to generate a unique room code.");
+  }
+
+  function buildStateSyncPayload(snapshot: SessionSnapshot, socket: any) {
+    const participant = snapshot.participants[socket.id];
+    const role = (socket.data.role || participant?.role || "participant") as UserRole;
+    const userName = String(socket.data.userName || participant?.userName || "").trim();
+
+    return {
+      room: {
+        code: snapshot.room.code,
+        adminUserName: snapshot.room.adminUserName,
+        status: snapshot.room.status,
+        participantCount: Object.keys(snapshot.participants).length,
+      },
+      state: snapshot.state,
+      currentUser: {
+        userName,
+        role,
+        isAdmin: role === "admin",
+      },
+    };
+  }
+
+  async function emitStateSync(socket: any, roomContext: RoomContext) {
+    const snapshot = await roomContext.store.getSnapshot();
+    socket.emit("state_sync", buildStateSyncPayload(snapshot, socket));
+    const participant = snapshot.participants[socket.id];
+    if (participant) {
+      socket.emit("credits_updated", { credits: participant.credits, votes: participant.votes });
+    }
+  }
+
+  async function getActiveRoom(socket: any) {
+    const roomCode = socket.data.roomCode as string | undefined;
+    if (!roomCode) {
+      socket.emit("room_error", { message: "Join a room first." });
+      return null;
+    }
+
+    const roomContext = await getRoomContext(roomCode, false);
+    if (!roomContext) {
+      clearSocketRoom(socket);
+      socket.emit("room_error", { message: "This room is no longer available." });
+      return null;
+    }
+
+    const snapshot = await roomContext.store.getSnapshot();
+    if (snapshot.room.status !== "active") {
+      await socket.leave(roomCode);
+      clearSocketRoom(socket);
+      socket.emit("room_closed", {
+        roomCode,
+        adminUserName: snapshot.room.adminUserName,
+        message: "This room is no longer active.",
+      });
+      await cleanupRoomContextIfUnused(roomCode);
+      return null;
+    }
+
+    return { roomCode, roomContext, snapshot };
+  }
+
+  function interruptAnchorAudio(roomContext: RoomContext) {
+    roomContext.currentAnchorAnnouncementId += 1;
+    io.to(roomContext.roomCode).emit("anchor_audio_interrupted", {
+      announcementId: roomContext.currentAnchorAnnouncementId,
+      createdAt: Date.now(),
+    });
+    return roomContext.currentAnchorAnnouncementId;
+  }
+
+  function startAnchorSessionIfNeeded(roomContext: RoomContext) {
+    if (roomContext.anchorLiveSessionPromise) return roomContext.anchorLiveSessionPromise;
 
     const newSessionPromise = getAI().live.connect({
       model: "gemini-2.5-flash-native-audio-preview-09-2025",
       callbacks: {
         onopen: () => {
-          logToFile("Anchor live session connected");
+          logToFile(`Anchor live session connected for ${roomContext.roomCode}`);
         },
         onmessage: (message: LiveServerMessage) => {
           if (message.serverContent?.modelTurn?.parts) {
             for (const part of message.serverContent.modelTurn.parts) {
               if (part.inlineData?.data) {
-                targetIO.emit("anchor_audio_response", {
-                  announcementId: anchorResponseAnnouncementId,
+                io.to(roomContext.roomCode).emit("anchor_audio_response", {
+                  announcementId: roomContext.anchorResponseAnnouncementId,
                   data: part.inlineData.data,
                   mimeType: part.inlineData.mimeType,
                 });
@@ -267,25 +437,25 @@ async function startServer() {
             }
           }
           if (message.serverContent?.interrupted) {
-            targetIO.emit("anchor_audio_interrupted", {
-              announcementId: anchorResponseAnnouncementId,
+            io.to(roomContext.roomCode).emit("anchor_audio_interrupted", {
+              announcementId: roomContext.anchorResponseAnnouncementId,
               createdAt: Date.now(),
             });
           }
         },
         onclose: () => {
-          logToFile("Anchor live session disconnected");
-          if (anchorLiveSessionPromise === newSessionPromise) {
-            anchorLiveSessionPromise = null;
+          logToFile(`Anchor live session disconnected for ${roomContext.roomCode}`);
+          if (roomContext.anchorLiveSessionPromise === newSessionPromise) {
+            roomContext.anchorLiveSessionPromise = null;
           }
         },
         onerror: (error: any) => {
           console.error("Anchor live error:", error.message, error.error);
-          targetIO.emit("error", {
+          io.to(roomContext.roomCode).emit("error", {
             message: `Anchor live error: ${error.message || error.error?.message || "Unknown error"}`,
           });
-          if (anchorLiveSessionPromise === newSessionPromise) {
-            anchorLiveSessionPromise = null;
+          if (roomContext.anchorLiveSessionPromise === newSessionPromise) {
+            roomContext.anchorLiveSessionPromise = null;
           }
         },
       },
@@ -302,21 +472,21 @@ async function startServer() {
       },
     });
 
-    anchorLiveSessionPromise = newSessionPromise;
-    anchorLiveSessionPromise.catch((error) => {
+    roomContext.anchorLiveSessionPromise = newSessionPromise;
+    roomContext.anchorLiveSessionPromise.catch((error) => {
       console.error("Anchor live connect error:", error);
-      if (anchorLiveSessionPromise === newSessionPromise) {
-        anchorLiveSessionPromise = null;
+      if (roomContext.anchorLiveSessionPromise === newSessionPromise) {
+        roomContext.anchorLiveSessionPromise = null;
       }
     });
 
-    return anchorLiveSessionPromise;
+    return roomContext.anchorLiveSessionPromise;
   }
 
-  async function speakAnchorAnnouncement(targetIO: Server, text: string) {
-    const announcementId = interruptAnchorAudio(targetIO);
-    anchorResponseAnnouncementId = announcementId;
-    const session = await startAnchorSessionIfNeeded(targetIO);
+  async function speakAnchorAnnouncement(roomContext: RoomContext, text: string) {
+    const announcementId = interruptAnchorAudio(roomContext);
+    roomContext.anchorResponseAnnouncementId = announcementId;
+    const session = await startAnchorSessionIfNeeded(roomContext);
     await session.sendClientContent({
       turns: [
         {
@@ -440,7 +610,7 @@ async function startServer() {
     }
   }
 
-  async function scheduleIdeaResearch(ideaId: string, ideaText: string, authorId: string) {
+  async function scheduleIdeaResearch(roomCode: string, ideaId: string, ideaText: string, authorId: string) {
     if (authorId.startsWith("agent-")) return;
 
     getAI()
@@ -453,35 +623,36 @@ async function startServer() {
       })
       .then(async (response) => {
         const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
-        if (!chunks?.length) {
-          return;
-        }
+        if (!chunks?.length) return;
 
         const firstChunk = chunks.find((chunk) => chunk.web?.uri);
-        if (!firstChunk?.web?.uri) {
-          return;
-        }
+        if (!firstChunk?.web?.uri) return;
+
+        const roomContext = await getRoomContext(roomCode, false);
+        if (!roomContext) return;
+        const snapshot = await roomContext.store.getSnapshot();
+        if (snapshot.room.status !== "active") return;
 
         const url = firstChunk.web.uri;
         const urlTitle = firstChunk.web.title || (response.text || "").substring(0, 30);
-        const snapshot = await sessionStore.mutate((nextSnapshot) => {
-          const idea = nextSnapshot.state.ideas.find((entry) => entry.id === ideaId);
+        const nextSnapshot = await roomContext.store.mutate((mutableSnapshot) => {
+          const idea = mutableSnapshot.state.ideas.find((entry) => entry.id === ideaId);
           if (!idea) return;
           idea.url = url;
           idea.urlTitle = urlTitle;
         });
 
-        if (snapshot.state.ideas.some((idea) => idea.id === ideaId)) {
-          io.emit("idea_researched", { id: ideaId, url, urlTitle });
+        if (nextSnapshot.state.ideas.some((idea) => idea.id === ideaId)) {
+          io.to(roomCode).emit("idea_researched", { id: ideaId, url, urlTitle });
         }
       })
       .catch((error) => {
         console.error("Researcher error:", error);
-        io.emit("error", { message: `Researcher error: ${error.message}` });
+        io.to(roomCode).emit("error", { message: `Researcher error: ${error.message}` });
       });
   }
 
-  async function scheduleIdeaEmbedding(ideaId: string, contents: string) {
+  async function scheduleIdeaEmbedding(roomCode: string, ideaId: string, contents: string) {
     getAI()
       .models.embedContent({
         model: "gemini-embedding-001",
@@ -491,15 +662,20 @@ async function startServer() {
         const embedding = response.embeddings?.[0]?.values;
         if (!embedding) return;
 
+        const roomContext = await getRoomContext(roomCode, false);
+        if (!roomContext) return;
+        const snapshot = await roomContext.store.getSnapshot();
+        if (snapshot.room.status !== "active") return;
+
         const targetPosition = projectTo3D(embedding);
-        const snapshot = await sessionStore.mutate((nextSnapshot) => {
-          const idea = nextSnapshot.state.ideas.find((entry) => entry.id === ideaId);
+        const nextSnapshot = await roomContext.store.mutate((mutableSnapshot) => {
+          const idea = mutableSnapshot.state.ideas.find((entry) => entry.id === ideaId);
           if (!idea) return;
           idea.targetPosition = targetPosition;
         });
 
-        if (snapshot.state.ideas.some((idea) => idea.id === ideaId)) {
-          io.emit("idea_positioned", { id: ideaId, targetPosition });
+        if (nextSnapshot.state.ideas.some((idea) => idea.id === ideaId)) {
+          io.to(roomCode).emit("idea_positioned", { id: ideaId, targetPosition });
         }
       })
       .catch((error) => {
@@ -507,7 +683,7 @@ async function startServer() {
       });
   }
 
-  async function addIdea(params: {
+  async function addIdea(roomContext: RoomContext, params: {
     id?: string;
     text: string;
     cluster?: string;
@@ -534,7 +710,7 @@ async function startServer() {
       targetPosition: null,
     };
 
-    await sessionStore.mutate((snapshot) => {
+    await roomContext.store.mutate((snapshot) => {
       enforceIdeaLimit(snapshot.state.ideas);
       snapshot.state.ideas.push(idea);
       snapshot.metadata.lastIdeaTime = now;
@@ -543,33 +719,22 @@ async function startServer() {
       }
     });
 
-    io.emit("ideas_batch_added", [idea]);
-    void scheduleIdeaResearch(idea.id, idea.text, idea.authorId);
-    void scheduleIdeaEmbedding(idea.id, idea.text);
+    io.to(roomContext.roomCode).emit("ideas_batch_added", [idea]);
+    void scheduleIdeaResearch(roomContext.roomCode, idea.id, idea.text, idea.authorId);
+    void scheduleIdeaEmbedding(roomContext.roomCode, idea.id, idea.text);
     return idea;
   }
 
-  async function upsertParticipant(
-    socketId: string,
-    userName: string,
-    role: "admin" | "participant" = "participant",
-  ) {
-    const snapshot = await sessionStore.mutate((nextSnapshot) => {
-      const existingRole = nextSnapshot.participants[socketId]?.role;
-      upsertParticipantRecord(nextSnapshot, socketId, userName, existingRole || role);
-    });
-    return snapshot.participants[socketId] || null;
-  }
-
-  async function broadcastUntouchedDirection(targetIO: Server, reason: "auto" | "manual") {
-    if (directionSuggestionInFlight) {
+  async function broadcastUntouchedDirection(roomCode: string, reason: SuggestionReason) {
+    const roomContext = await getRoomContext(roomCode, false);
+    if (!roomContext || roomContext.directionSuggestionInFlight) {
       return;
     }
 
-    directionSuggestionInFlight = true;
+    roomContext.directionSuggestionInFlight = true;
     try {
-      const snapshot = await sessionStore.getSnapshot();
-      if (snapshot.state.phase !== "divergent") {
+      const snapshot = await roomContext.store.getSnapshot();
+      if (snapshot.room.status !== "active" || snapshot.state.phase !== "divergent") {
         return;
       }
 
@@ -603,7 +768,7 @@ async function startServer() {
       }
 
       let shouldBroadcast = true;
-      await sessionStore.mutate((nextSnapshot) => {
+      await roomContext.store.mutate((nextSnapshot) => {
         if (
           shouldSkipRepeatedSuggestion({
             reason,
@@ -625,26 +790,35 @@ async function startServer() {
         return;
       }
 
-      targetIO.emit("direction_suggestion", {
+      io.to(roomCode).emit("direction_suggestion", {
         suggestion,
         rationale,
         reason,
         kind,
         createdAt: now,
       });
-      await speakAnchorAnnouncement(targetIO, suggestion);
+      await speakAnchorAnnouncement(roomContext, suggestion);
     } catch (error: any) {
       console.error("Error finding untouched direction:", error);
       logToFile(`Error finding untouched direction: ${error.message}`);
     } finally {
-      directionSuggestionInFlight = false;
+      roomContext.directionSuggestionInFlight = false;
     }
   }
 
-  setInterval(async () => {
-    const snapshot = await sessionStore.getSnapshot();
-    if (!snapshot.state.topic || Object.keys(snapshot.participants).length === 0) return;
-    if (snapshot.state.ideas.length <= 3) return;
+  async function runSynthesizer(roomCode: string) {
+    const roomContext = await getRoomContext(roomCode, false);
+    if (!roomContext) return;
+
+    const snapshot = await roomContext.store.getSnapshot();
+    if (
+      snapshot.room.status !== "active" ||
+      !snapshot.state.topic ||
+      Object.keys(snapshot.participants).length === 0 ||
+      snapshot.state.ideas.length <= 3
+    ) {
+      return;
+    }
 
     try {
       const response = await withTimeout(
@@ -652,7 +826,7 @@ async function startServer() {
           model: "gemini-3.1-flash-lite-preview",
           contents: `Here are the current ideas: ${JSON.stringify(
             snapshot.state.ideas.map((idea) => ({ id: idea.id, text: idea.text })),
-          ) }.
+          )}.
           Find 1-2 strong connections between existing ideas that aren't obvious.
           Return a JSON array of objects with 'sourceId', 'targetId', and 'reason'.`,
           config: { responseMimeType: "application/json" },
@@ -663,7 +837,7 @@ async function startServer() {
 
       const newEdges = JSON.parse(response.text || "[]");
       let changed = false;
-      const nextSnapshot = await sessionStore.mutate((mutableSnapshot) => {
+      const nextSnapshot = await roomContext.store.mutate((mutableSnapshot) => {
         if (!Array.isArray(newEdges)) {
           return;
         }
@@ -690,18 +864,27 @@ async function startServer() {
       });
 
       if (changed) {
-        io.emit("edges_updated", nextSnapshot.state.edges);
+        io.to(roomCode).emit("edges_updated", nextSnapshot.state.edges);
       }
     } catch (error: any) {
       console.error("Synthesizer error:", error);
-      io.emit("error", { message: `Synthesizer error: ${error.message}` });
+      io.to(roomCode).emit("error", { message: `Synthesizer error: ${error.message}` });
     }
-  }, 45000);
+  }
 
-  setInterval(async () => {
-    const snapshot = await sessionStore.getSnapshot();
-    if (!snapshot.state.topic || Object.keys(snapshot.participants).length === 0) return;
-    if (snapshot.state.ideas.length <= 5) return;
+  async function runDevilsAdvocate(roomCode: string) {
+    const roomContext = await getRoomContext(roomCode, false);
+    if (!roomContext) return;
+
+    const snapshot = await roomContext.store.getSnapshot();
+    if (
+      snapshot.room.status !== "active" ||
+      !snapshot.state.topic ||
+      Object.keys(snapshot.participants).length === 0 ||
+      snapshot.state.ideas.length <= 5
+    ) {
+      return;
+    }
 
     try {
       const response = await withTimeout(
@@ -721,7 +904,7 @@ async function startServer() {
       const result = JSON.parse(response.text || "{}");
       if (!result.idea) return;
 
-      await addIdea({
+      await addIdea(roomContext, {
         text: result.idea,
         cluster: result.category || "Critique",
         authorId: "agent-critic",
@@ -731,32 +914,102 @@ async function startServer() {
       });
     } catch (error: any) {
       console.error("Devil's Advocate error:", error);
-      io.emit("error", { message: `Devil's Advocate error: ${error.message}` });
+      io.to(roomCode).emit("error", { message: `Devil's Advocate error: ${error.message}` });
     }
-  }, 90000);
+  }
 
-  setInterval(async () => {
-    const snapshot = await sessionStore.getSnapshot();
-    if (
-      shouldAutoBroadcastSuggestion({
-        phase: snapshot.state.phase,
-        ideaCount: snapshot.state.ideas.length,
-        quietParticipantCount: getQuietParticipantNamesForAnchor(snapshot, Date.now()).length,
-        lastIdeaTime: snapshot.metadata.lastIdeaTime,
-        lastDirectionSuggestionTime: snapshot.metadata.lastDirectionSuggestionTime,
-        now: Date.now(),
-      })
-    ) {
-      void broadcastUntouchedDirection(io, "auto");
+  function enableRoomRuntime(roomContext: RoomContext) {
+    if (roomContext.runtimeEnabled) {
+      return;
     }
-  }, 5000);
+
+    roomContext.runtimeEnabled = true;
+    roomContext.synthesizerInterval = setInterval(() => {
+      void runSynthesizer(roomContext.roomCode);
+    }, 45000);
+
+    roomContext.criticInterval = setInterval(() => {
+      void runDevilsAdvocate(roomContext.roomCode);
+    }, 90000);
+
+    roomContext.suggestionInterval = setInterval(async () => {
+      const snapshot = await roomContext.store.getSnapshot();
+      if (
+        shouldAutoBroadcastSuggestion({
+          phase: snapshot.state.phase,
+          ideaCount: snapshot.state.ideas.length,
+          quietParticipantCount: getQuietParticipantNamesForAnchor(snapshot, Date.now()).length,
+          lastIdeaTime: snapshot.metadata.lastIdeaTime,
+          lastDirectionSuggestionTime: snapshot.metadata.lastDirectionSuggestionTime,
+          now: Date.now(),
+        })
+      ) {
+        void broadcastUntouchedDirection(roomContext.roomCode, "auto");
+      }
+    }, 5000);
+  }
+
+  async function closeRoom(roomCode: string, message = "The admin closed this room.") {
+    const roomContext = await getRoomContext(roomCode, false);
+    if (!roomContext) {
+      return;
+    }
+
+    const snapshot = await roomContext.store.getSnapshot();
+    if (snapshot.room.status === "closed") {
+      await cleanupRoomContextIfUnused(roomCode);
+      return;
+    }
+
+    await roomContext.store.mutate((mutableSnapshot) => {
+      mutableSnapshot.room.status = "closed";
+      mutableSnapshot.participants = {};
+    });
+
+    io.to(roomCode).emit("room_closed", {
+      roomCode,
+      adminUserName: snapshot.room.adminUserName,
+      message,
+    });
+
+    for (const localSocket of getLocalSocketsForRoom(roomCode)) {
+      await localSocket.leave(roomCode);
+      clearSocketRoom(localSocket);
+    }
+
+    await cleanupRoomContextIfUnused(roomCode);
+  }
+
+  async function leaveRoom(socket: any, options: { silent?: boolean; reason?: string } = {}) {
+    const roomCode = socket.data.roomCode as string | undefined;
+    if (!roomCode) {
+      return;
+    }
+
+    const role = socket.data.role as UserRole | undefined;
+    await socket.leave(roomCode);
+
+    const roomContext = await getRoomContext(roomCode, false);
+    if (roomContext) {
+      const snapshot = await roomContext.store.getSnapshot();
+      if (snapshot.room.status === "active") {
+        if (role === "admin" && snapshot.room.adminSocketId === socket.id) {
+          await closeRoom(roomCode, options.reason || "The admin left the room.");
+        } else {
+          await roomContext.store.removeParticipant(socket.id);
+        }
+      }
+    }
+
+    clearSocketRoom(socket);
+    if (!options.silent) {
+      socket.emit("room_left", { roomCode });
+    }
+    await cleanupRoomContextIfUnused(roomCode);
+  }
 
   io.on("connection", (socket) => {
     console.log("Client connected:", socket.id);
-
-    void sessionStore.getSnapshot().then((snapshot) => {
-      socket.emit("state_sync", snapshot.state);
-    });
 
     let liveSessionPromise: Promise<any> | null = null;
     let audioActive = false;
@@ -792,8 +1045,15 @@ async function startServer() {
       }
     };
 
-    const startSessionIfNeeded = (topic: string, userName: string) => {
+    const startSessionIfNeeded = async () => {
       if (liveSessionPromise) return;
+
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
+
+      const currentTopic = activeRoom.snapshot.state.topic || "Brainstorming Session";
+      const currentUserName = String(socket.data.userName || "").trim() || "Anonymous Node";
+      const roomCode = activeRoom.roomCode;
 
       const newSessionPromise = getAI().live.connect({
         model: "gemini-2.5-flash-native-audio-preview-09-2025",
@@ -828,12 +1088,15 @@ async function startServer() {
 
               if (call.name === "extractIdea") {
                 const args = call.args as { idea?: string; category?: string };
-                const addedIdea = await addIdea({
-                  text: args.idea || "",
-                  cluster: args.category || "General",
-                  authorId: socket.id,
-                  authorName: userName || "Anonymous Node",
-                });
+                const roomContext = await getRoomContext(roomCode, false);
+                const addedIdea = roomContext
+                  ? await addIdea(roomContext, {
+                      text: args.idea || "",
+                      cluster: args.category || "General",
+                      authorId: socket.id,
+                      authorName: currentUserName,
+                    })
+                  : null;
 
                 functionResponses.push({
                   id: call.id,
@@ -844,31 +1107,33 @@ async function startServer() {
                 });
               } else if (call.name === "generateMermaid") {
                 const args = call.args as { code?: string };
-                io.emit("update_mermaid", args.code);
+                io.to(roomCode).emit("update_mermaid", args.code);
                 functionResponses.push({
                   id: call.id,
                   name: call.name,
                   response: { result: "Mermaid diagram generated successfully" },
                 });
               } else if (call.name === "getIdeas") {
-                const snapshot = await sessionStore.getSnapshot();
+                const roomContext = await getRoomContext(roomCode, false);
+                const snapshot = roomContext ? await roomContext.store.getSnapshot() : null;
                 functionResponses.push({
                   id: call.id,
                   name: call.name,
                   response: {
-                    ideas: snapshot.state.ideas.map((idea) => ({
+                    ideas: snapshot?.state.ideas.map((idea) => ({
                       text: idea.text,
                       cluster: idea.cluster,
                       weight: idea.weight,
-                    })),
+                    })) || [],
                   },
                 });
               } else if (call.name === "getSessionSnapshot") {
-                const snapshot = await sessionStore.getSnapshot();
+                const roomContext = await getRoomContext(roomCode, false);
+                const snapshot = roomContext ? await roomContext.store.getSnapshot() : null;
                 functionResponses.push({
                   id: call.id,
                   name: call.name,
-                  response: buildSessionSummary(snapshot),
+                  response: snapshot ? buildSessionSummary(snapshot) : {},
                 });
               }
             }
@@ -906,7 +1171,7 @@ async function startServer() {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
           },
           systemInstruction: `You are the playful live anchor of "The Cognitive Swarm".
-          Topic: "${topic}". Current speaker: ${userName}.
+          Topic: "${currentTopic}". Current speaker: ${currentUserName}.
 
           LANGUAGE RULE: Always respond in English only, regardless of the language or accent of the speaker. Never switch to any other language.
 
@@ -991,25 +1256,152 @@ async function startServer() {
       });
     };
 
-    socket.on("register_participant", async (data: { userName: string; role: "admin" | "participant" }) => {
-      const participant = await upsertParticipant(socket.id, data.userName, data.role);
-      if (participant) {
-        socket.emit("credits_updated", { credits: participant.credits, votes: participant.votes });
+    socket.on("create_room", async (data: { userName: string; topic: string }) => {
+      const userName = data.userName?.trim();
+      const topic = data.topic?.trim();
+      if (!userName || !topic) {
+        socket.emit("room_error", { message: "Display name and topic are required to create a room." });
+        return;
+      }
+
+      if (socket.data.roomCode) {
+        await leaveRoom(socket, { silent: true, reason: "The admin left the room." });
+      }
+
+      try {
+        const roomCode = await allocateRoomCode();
+        const roomContext = await getRoomContext(roomCode, true);
+        if (!roomContext) {
+          socket.emit("room_error", { message: "Failed to create the room." });
+          return;
+        }
+
+        const snapshot = await roomContext.store.mutate((mutableSnapshot) => {
+          mutableSnapshot.room.code = roomCode;
+          mutableSnapshot.room.adminSocketId = socket.id;
+          mutableSnapshot.room.adminUserName = userName;
+          mutableSnapshot.room.status = "active";
+          mutableSnapshot.state.topic = topic;
+          mutableSnapshot.state.phase = "divergent";
+          upsertParticipantRecord(mutableSnapshot, socket.id, userName, "admin");
+        });
+
+        socket.data.roomCode = roomCode;
+        socket.data.role = "admin";
+        socket.data.userName = userName;
+        await socket.join(roomCode);
+        enableRoomRuntime(roomContext);
+
+        socket.emit("room_created", {
+          roomCode,
+          adminUserName: snapshot.room.adminUserName,
+        });
+        await emitStateSync(socket, roomContext);
+      } catch (error: any) {
+        socket.emit("room_error", { message: error.message || "Unable to create room." });
       }
     });
 
-    socket.on("interrupt_anchor", () => {
-      interruptAnchorAudio(io);
+    socket.on("join_room", async (data: { roomCode: string; userName: string }) => {
+      const userName = data.userName?.trim();
+      const roomCode = normalizeRoomCode(data.roomCode || "");
+      if (!userName || !roomCode) {
+        socket.emit("room_error", { message: "Display name and room code are required." });
+        return;
+      }
+      if (!isValidRoomCode(roomCode)) {
+        socket.emit("room_error", { message: "Enter a valid 6-character room code." });
+        return;
+      }
+
+      if (socket.data.roomCode) {
+        await leaveRoom(socket, { silent: true });
+      }
+
+      const roomContext = await getRoomContext(roomCode, false);
+      if (!roomContext) {
+        socket.emit("room_error", { message: "Room not found." });
+        return;
+      }
+
+      const currentSnapshot = await roomContext.store.getSnapshot();
+      if (currentSnapshot.room.status !== "active") {
+        socket.emit("room_error", { message: "That room is closed." });
+        await cleanupRoomContextIfUnused(roomCode);
+        return;
+      }
+
+      await roomContext.store.mutate((mutableSnapshot) => {
+        upsertParticipantRecord(mutableSnapshot, socket.id, userName, "participant");
+      });
+
+      socket.data.roomCode = roomCode;
+      socket.data.role = "participant";
+      socket.data.userName = userName;
+      await socket.join(roomCode);
+
+      socket.emit("room_joined", {
+        roomCode,
+        adminUserName: currentSnapshot.room.adminUserName,
+      });
+      await emitStateSync(socket, roomContext);
     });
 
-    socket.on("start_audio_session", async (data: { topic: string; userName: string }) => {
+    socket.on("leave_room", async () => {
+      await leaveRoom(socket);
+    });
+
+    socket.on("close_room", async () => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
+      if (!isAdmin(activeRoom.snapshot.participants[socket.id])) {
+        socket.emit("room_error", { message: "Only the admin can close the room." });
+        return;
+      }
+      await closeRoom(activeRoom.roomCode, "The admin closed this room.");
+    });
+
+    socket.on("register_participant", async (data: { userName: string; role: UserRole }) => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
+      const participant = await activeRoom.roomContext.store.mutate((mutableSnapshot) => {
+        upsertParticipantRecord(
+          mutableSnapshot,
+          socket.id,
+          data.userName || String(socket.data.userName || ""),
+          socket.data.role || data.role,
+        );
+      });
+
+      const currentParticipant = participant.participants[socket.id];
+      if (currentParticipant) {
+        socket.emit("credits_updated", { credits: currentParticipant.credits, votes: currentParticipant.votes });
+      }
+    });
+
+    socket.on("interrupt_anchor", async () => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
+      interruptAnchorAudio(activeRoom.roomContext);
+    });
+
+    socket.on("start_audio_session", async () => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
       logToFile(`start_audio_session received for ${socket.id}`);
       audioActive = true;
       audioStreamStarted = false;
       clearPendingSessionClose();
-      interruptAnchorAudio(io);
-      await upsertParticipant(socket.id, data.userName);
-      startSessionIfNeeded(data.topic, data.userName);
+      interruptAnchorAudio(activeRoom.roomContext);
+      await activeRoom.roomContext.store.mutate((mutableSnapshot) => {
+        upsertParticipantRecord(
+          mutableSnapshot,
+          socket.id,
+          String(socket.data.userName || "Anonymous Node"),
+          (socket.data.role || "participant") as UserRole,
+        );
+      });
+      await startSessionIfNeeded();
     });
 
     socket.on("stop_audio_session", () => {
@@ -1031,16 +1423,31 @@ async function startServer() {
       }
     });
 
-    socket.on("suggest_direction", () => {
+    socket.on("suggest_direction", async () => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
+      if (!isAdmin(activeRoom.snapshot.participants[socket.id])) {
+        socket.emit("room_error", { message: "Only the admin can cue the anchor." });
+        return;
+      }
       logToFile(`suggest_direction received for ${socket.id}`);
-      void broadcastUntouchedDirection(io, "manual");
+      void broadcastUntouchedDirection(activeRoom.roomCode, "manual");
     });
 
-    socket.on("start_video_session", async (data: { topic: string; userName: string }) => {
+    socket.on("start_video_session", async () => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
       videoActive = true;
       clearPendingSessionClose();
-      await upsertParticipant(socket.id, data.userName);
-      startSessionIfNeeded(data.topic, data.userName);
+      await activeRoom.roomContext.store.mutate((mutableSnapshot) => {
+        upsertParticipantRecord(
+          mutableSnapshot,
+          socket.id,
+          String(socket.data.userName || "Anonymous Node"),
+          (socket.data.role || "participant") as UserRole,
+        );
+      });
+      await startSessionIfNeeded();
     });
 
     socket.on("stop_video_session", () => {
@@ -1048,9 +1455,11 @@ async function startServer() {
       stopSessionIfNeeded();
     });
 
-    socket.on("text_chunk", (text: string) => {
+    socket.on("text_chunk", async (text: string) => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
       logToFile(`Received text chunk: ${text}`);
-      interruptAnchorAudio(io);
+      interruptAnchorAudio(activeRoom.roomContext);
       if (liveSessionPromise) {
         liveSessionPromise
           .then((session) => {
@@ -1066,7 +1475,9 @@ async function startServer() {
       }
     });
 
-    socket.on("audio_chunk", (base64Data: string) => {
+    socket.on("audio_chunk", async (base64Data: string) => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
       audioChunkCount += 1;
       audioStreamStarted = true;
       clearPendingSessionClose();
@@ -1097,7 +1508,9 @@ async function startServer() {
       }
     });
 
-    socket.on("video_chunk", (base64Data: string) => {
+    socket.on("video_chunk", async (base64Data: string) => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
       clearPendingSessionClose();
       if (liveSessionPromise) {
         liveSessionPromise
@@ -1114,44 +1527,51 @@ async function startServer() {
     });
 
     socket.on("set_topic", async (topic: string) => {
-      const snapshot = await sessionStore.getSnapshot();
-      if (!isAdmin(snapshot.participants[socket.id])) return;
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
+      if (!isAdmin(activeRoom.snapshot.participants[socket.id])) return;
       if (typeof topic !== "string" || !topic.trim()) return;
 
-      const nextSnapshot = await sessionStore.mutate((mutableSnapshot) => {
+      const nextSnapshot = await activeRoom.roomContext.store.mutate((mutableSnapshot) => {
         mutableSnapshot.state.topic = topic.trim();
       });
-      io.emit("topic_updated", nextSnapshot.state.topic);
+      io.to(activeRoom.roomCode).emit("topic_updated", nextSnapshot.state.topic);
     });
 
     socket.on("add_idea", async (idea: { id?: string; text: string; cluster: string; authorName?: string }) => {
-      await addIdea({
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
+      await addIdea(activeRoom.roomContext, {
         id: idea.id,
         text: idea.text,
         cluster: idea.cluster,
         authorId: socket.id,
-        authorName: idea.authorName || "Anonymous Node",
+        authorName: idea.authorName || String(socket.data.userName || "Anonymous Node"),
       });
     });
 
     socket.on("update_idea_embedding", async (data: { id: string; embedding: number[] }) => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
       const targetPosition = projectTo3D(data.embedding);
-      const snapshot = await sessionStore.mutate((mutableSnapshot) => {
+      const snapshot = await activeRoom.roomContext.store.mutate((mutableSnapshot) => {
         const idea = mutableSnapshot.state.ideas.find((entry) => entry.id === data.id);
         if (!idea) return;
         idea.targetPosition = targetPosition;
       });
 
       if (snapshot.state.ideas.some((idea) => idea.id === data.id)) {
-        io.emit("idea_positioned", { id: data.id, targetPosition });
+        io.to(activeRoom.roomCode).emit("idea_positioned", { id: data.id, targetPosition });
       }
     });
 
     socket.on("update_idea_weight", async (data: { ideaId: string; weightChange: number }) => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
       let updatedWeight: number | null = null;
       let creditsPayload: { credits: number; votes: Record<string, number> } | null = null;
 
-      await sessionStore.mutate((snapshot) => {
+      await activeRoom.roomContext.store.mutate((snapshot) => {
         const participant = snapshot.participants[socket.id];
         if (!participant) return;
 
@@ -1176,17 +1596,19 @@ async function startServer() {
 
       if (!creditsPayload || updatedWeight === null) return;
       socket.emit("credits_updated", creditsPayload);
-      io.emit("idea_weight_updated", { ideaId: data.ideaId, weight: updatedWeight });
-      io.emit("ideas_batch_updated", [{ id: data.ideaId, weight: updatedWeight }]);
+      io.to(activeRoom.roomCode).emit("idea_weight_updated", { ideaId: data.ideaId, weight: updatedWeight });
+      io.to(activeRoom.roomCode).emit("ideas_batch_updated", [{ id: data.ideaId, weight: updatedWeight }]);
     });
 
     socket.on("edit_idea", async (data: { id: string; text: string; cluster: string; textChanged?: boolean }) => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
       const sanitizedText = sanitizeIdeaInput(data.text);
       if (!sanitizedText.valid) return;
       const sanitizedCluster = sanitizeIdeaInput(data.cluster || "General", 100);
 
       let updatedIdea: IdeaRecord | null = null;
-      const snapshot = await sessionStore.mutate((mutableSnapshot) => {
+      const snapshot = await activeRoom.roomContext.store.mutate((mutableSnapshot) => {
         const idea = mutableSnapshot.state.ideas.find((entry) => entry.id === data.id);
         if (!idea) return;
 
@@ -1196,35 +1618,38 @@ async function startServer() {
       });
 
       if (!snapshot.state.ideas.some((idea) => idea.id === data.id) || !updatedIdea) return;
-      io.emit("ideas_batch_updated", [updatedIdea]);
+      io.to(activeRoom.roomCode).emit("ideas_batch_updated", [updatedIdea]);
 
       if (data.textChanged) {
-        void scheduleIdeaEmbedding(data.id, sanitizedText.text);
+        void scheduleIdeaEmbedding(activeRoom.roomCode, data.id, sanitizedText.text);
       }
     });
 
     socket.on("update_flow", async (data: { nodes: any[]; edges: any[] }) => {
-      const snapshot = await sessionStore.mutate((mutableSnapshot) => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
+      const snapshot = await activeRoom.roomContext.store.mutate((mutableSnapshot) => {
         mutableSnapshot.state.flowData = data;
       });
-      io.emit("flow_updated", snapshot.state.flowData);
+      io.to(activeRoom.roomCode).emit("flow_updated", snapshot.state.flowData);
     });
 
     socket.on("forge_artifact", async () => {
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
       try {
-        const snapshot = await sessionStore.getSnapshot();
         const artifact = await forgeArtifactFromTopic(
-          snapshot.state.topic || "Brainstorming Session",
-          snapshot.state.ideas.map((idea) => ({
+          activeRoom.snapshot.state.topic || "Brainstorming Session",
+          activeRoom.snapshot.state.ideas.map((idea) => ({
             text: idea.text,
             cluster: idea.cluster,
             weight: idea.weight,
           })),
         );
-        await sessionStore.mutate((mutableSnapshot) => {
+        await activeRoom.roomContext.store.mutate((mutableSnapshot) => {
           mutableSnapshot.state.artifactData = artifact;
         });
-        io.emit("artifact_updated", artifact);
+        io.to(activeRoom.roomCode).emit("artifact_updated", artifact);
       } catch (error: any) {
         console.error("Artifact forge failed:", error);
         socket.emit("error", { message: error.message || "Failed to forge topic-aware artifact." });
@@ -1232,21 +1657,22 @@ async function startServer() {
     });
 
     socket.on("set_phase", async (phase: string) => {
-      const snapshot = await sessionStore.getSnapshot();
-      if (!isAdmin(snapshot.participants[socket.id])) return;
+      const activeRoom = await getActiveRoom(socket);
+      if (!activeRoom) return;
+      if (!isAdmin(activeRoom.snapshot.participants[socket.id])) return;
       if (!isValidPhase(phase)) return;
 
-      const nextSnapshot = await sessionStore.mutate((mutableSnapshot) => {
+      const nextSnapshot = await activeRoom.roomContext.store.mutate((mutableSnapshot) => {
         mutableSnapshot.state.phase = phase;
       });
-      io.emit("phase_changed", nextSnapshot.state.phase);
+      io.to(activeRoom.roomCode).emit("phase_changed", nextSnapshot.state.phase);
     });
 
     socket.on("disconnect", () => {
       console.log("Client disconnected:", socket.id);
       clearPendingSessionClose();
       stopSessionIfNeeded();
-      void sessionStore.removeParticipant(socket.id);
+      void leaveRoom(socket, { silent: true, reason: "The admin left the room." });
     });
   });
 
@@ -1254,8 +1680,11 @@ async function startServer() {
     res.json({ status: "ok" });
   });
 
-  app.get("/api/ready", (_req, res) => {
-    const status = sessionStore.getStatus();
+  app.get("/api/ready", async (_req, res) => {
+    const defaultStore = new SessionStore(deploymentConfig, { createIfMissing: false });
+    await defaultStore.init();
+    const status = defaultStore.getStatus();
+    await defaultStore.close();
     res.status(status.ready ? 200 : 503).json({
       status: status.ready ? "ok" : "degraded",
       storage: status.storage,
@@ -1289,11 +1718,15 @@ async function startServer() {
   }
 
   const shutdown = async () => {
+    await Promise.allSettled(
+      Array.from(roomContexts.values()).map(async (roomContext) => {
+        if (roomContext.anchorLiveSessionPromise) {
+          await roomContext.anchorLiveSessionPromise.then((session) => session.close()).catch(() => undefined);
+        }
+        await roomContext.store.close();
+      }),
+    );
     await Promise.allSettled(shutdownClients.map((client) => client.quit()));
-    await sessionStore.close();
-    if (anchorLiveSessionPromise) {
-      await anchorLiveSessionPromise.then((session) => session.close()).catch(() => undefined);
-    }
     server.close();
   };
 

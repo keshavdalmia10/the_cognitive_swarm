@@ -13,8 +13,8 @@ const erIdeas = [
   { text: "Relationship: COURSE offered_by DEPARTMENT", cluster: "Relationship" },
 ];
 
-export function startSimulation(numClients = 5): () => void {
-  console.log(`Starting ER Diagram simulation with ${numClients} virtual students...`);
+export function startSimulation(numClients = 5, roomCode: string): () => void {
+  console.log(`Starting ER Diagram simulation with ${numClients} virtual students in room ${roomCode}...`);
   const sockets: Socket[] = Array.from({ length: numClients }).map(() => io());
 
   let globalIdeas: any[] = [];
@@ -22,9 +22,16 @@ export function startSimulation(numClients = 5): () => void {
   let ideaIndex = 0;
 
   sockets.forEach((socket, i) => {
-    socket.on('state_sync', (state) => {
-      globalIdeas = state.ideas;
-      globalTopic = state.topic;
+    const fakeNames = ["Ada", "Alan", "Grace", "Linus", "Tim", "Margaret"];
+    const simName = `Sim-${fakeNames[i % fakeNames.length]}-${i + 1}`;
+
+    socket.on('connect', () => {
+      socket.emit('join_room', { roomCode, userName: simName });
+    });
+
+    socket.on('state_sync', (payload) => {
+      globalIdeas = payload.state.ideas;
+      globalTopic = payload.state.topic;
     });
 
     socket.on('topic_updated', (topic) => {
@@ -56,8 +63,6 @@ export function startSimulation(numClients = 5): () => void {
         const idea = erIdeas[ideaIndex % erIdeas.length];
         ideaIndex++; 
         if (idea) {
-            const fakeNames = ["Ada", "Alan", "Grace", "Linus", "Tim", "Margaret"];
-            const simName = `Sim-${fakeNames[Math.floor(Math.random() * fakeNames.length)]}`;
             socket.emit('add_idea', { text: idea.text, cluster: idea.cluster, authorName: simName });
         }
       }
