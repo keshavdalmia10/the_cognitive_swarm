@@ -1,0 +1,28 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": false,
+    "isolatedModules": false,
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": false,
+    "outDir": "build",
+    "rewriteRelativeImportExtensions": true,
+    "rootDir": ".",
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": [
+    "server.ts",
+    "src/server/**/*.ts",
+    "src/utils/**/*.ts"
+  ],
+  "exclude": [
+    "build",
+    "dist",
+    "node_modules",
+    "src/**/*.tsx",
+    "tests/**/*"
+  ]
+}

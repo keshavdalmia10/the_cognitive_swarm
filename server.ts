@@ -1,21 +1,30 @@
 import express from "express";
-import { createServer as createViteServer } from "vite";
-import { Server } from "socket.io";
 import http from "http";
-import { GoogleGenAI, Type, LiveServerMessage, Modality } from "@google/genai";
 import path from "path";
+
 import dotenv from "dotenv";
+import { GoogleGenAI, LiveServerMessage, Modality, Type } from "@google/genai";
+import { createAdapter } from "@socket.io/redis-adapter";
+import { Server } from "socket.io";
+import { createServer as createViteServer } from "vite";
+
+import { createRedisClientFromConfig, getDeploymentConfig, type AppRedisClient } from "./src/server/runtimeConfig.ts";
+import { SessionStore } from "./src/server/sessionStore.ts";
+import type {
+  IdeaRecord,
+  SessionParticipant,
+  SessionSnapshot,
+} from "./src/server/sessionTypes.ts";
+import { buildFallbackArtifact, getDiagramLabel, inferDiagramType } from "./src/utils/artifactPolicy.ts";
+import type { ArtifactDiagramType, ArtifactIdea } from "./src/utils/artifactPolicy.ts";
 import {
   buildAudienceNudge,
   buildDevSpaHtml,
-  dedupeById,
   getQuietParticipantNames,
   shouldAutoBroadcastSuggestion,
   shouldSkipRepeatedSuggestion,
 } from "./src/utils/swarmPolicy.ts";
-import { buildFallbackArtifact, getDiagramLabel, inferDiagramType } from "./src/utils/artifactPolicy.ts";
-import type { ArtifactDiagramType, ArtifactIdea } from "./src/utils/artifactPolicy.ts";
-import { isAdmin, isValidPhase, INITIAL_CREDITS, validateVote, sanitizeIdeaInput } from './src/utils/serverGuards.ts';
+import { INITIAL_CREDITS, isAdmin, isValidPhase, sanitizeIdeaInput, validateVote } from "./src/utils/serverGuards.ts";
 
 dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
@@ -24,7 +33,7 @@ function logToFile(_msg: string) {}
 function emitInlineAudio(
   target: { emit: (eventName: string, payload: any) => boolean },
   eventName: string,
-  inlineData?: { data?: string; mimeType?: string | null }
+  inlineData?: { data?: string; mimeType?: string | null },
 ) {
   if (!inlineData?.data) return;
   target.emit(eventName, {
@@ -33,197 +42,210 @@ function emitInlineAudio(
   });
 }
 
-let _aiClient: InstanceType<typeof GoogleGenAI> | null = null;
+let aiClient: InstanceType<typeof GoogleGenAI> | null = null;
+
 function getAI() {
-  if (_aiClient) return _aiClient;
+  if (aiClient) return aiClient;
+
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     console.warn("No API key found in environment variables. Initializing without explicit key.");
-    _aiClient = new GoogleGenAI({});
+    aiClient = new GoogleGenAI({});
   } else {
     console.log("Initializing GoogleGenAI with API key of length:", apiKey.length);
-    logToFile("Initializing GoogleGenAI with API key of length: " + apiKey.length);
-    _aiClient = new GoogleGenAI({ apiKey });
+    logToFile(`Initializing GoogleGenAI with API key of length: ${apiKey.length}`);
+    aiClient = new GoogleGenAI({ apiKey });
   }
-  return _aiClient;
+
+  return aiClient;
 }
 
-// Generate a fixed random projection matrix (3 x 768) to map embeddings to 3D space
+const MAX_IDEAS = 200;
 const projectionMatrix = Array.from({ length: 3 }, () =>
-  Array.from({ length: 3072 }, () => (Math.random() - 0.5) * 2)
+  Array.from({ length: 3072 }, () => (Math.random() - 0.5) * 2),
 );
 
 function projectTo3D(embedding: number[]): [number, number, number] {
-  let x = 0, y = 0, z = 0;
-  for (let i = 0; i < embedding.length; i++) {
-    x += embedding[i] * projectionMatrix[0][i];
-    y += embedding[i] * projectionMatrix[1][i];
-    z += embedding[i] * projectionMatrix[2][i];
+  let x = 0;
+  let y = 0;
+  let z = 0;
+
+  for (let index = 0; index < embedding.length; index += 1) {
+    x += embedding[index] * projectionMatrix[0][index];
+    y += embedding[index] * projectionMatrix[1][index];
+    z += embedding[index] * projectionMatrix[2][index];
   }
-  // Normalize and scale to fit visual space
-  const mag = Math.sqrt(x * x + y * y + z * z);
-  if (mag === 0) return [0, 0, 0];
-  const scale = 12; // Spread radius
-  return [(x / mag) * scale, (y / mag) * scale, (z / mag) * scale];
+
+  const magnitude = Math.sqrt(x * x + y * y + z * z);
+  if (magnitude === 0) return [0, 0, 0];
+
+  const scale = 12;
+  return [(x / magnitude) * scale, (y / magnitude) * scale, (z / magnitude) * scale];
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     promise,
     new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms),
     ),
   ]);
 }
 
+function randomIdeaPosition(): [number, number, number] {
+  return [(Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20];
+}
+
+function enforceIdeaLimit(ideas: IdeaRecord[]) {
+  if (ideas.length < MAX_IDEAS) {
+    return;
+  }
+
+  const minIndex = ideas.reduce(
+    (lowestIndex, idea, index, list) =>
+      (idea.weight || 0) < (list[lowestIndex].weight || 0) ? index : lowestIndex,
+    0,
+  );
+  ideas.splice(minIndex, 1);
+}
+
+function upsertParticipantRecord(
+  snapshot: SessionSnapshot,
+  socketId: string,
+  userName: string,
+  role: "admin" | "participant" = "participant",
+): SessionParticipant | null {
+  const cleanedName = userName.trim();
+  if (!cleanedName) {
+    return snapshot.participants[socketId] || null;
+  }
+
+  const existing = snapshot.participants[socketId];
+  const now = Date.now();
+  const participant: SessionParticipant = {
+    socketId,
+    userName: cleanedName,
+    role,
+    joinedAt: existing?.joinedAt ?? now,
+    contributionCount: existing?.contributionCount ?? 0,
+    lastContributionAt: existing?.lastContributionAt ?? null,
+    credits: existing?.credits ?? INITIAL_CREDITS,
+    votes: existing?.votes ?? {},
+  };
+
+  snapshot.participants[socketId] = participant;
+  return participant;
+}
+
+function markParticipantContribution(
+  snapshot: SessionSnapshot,
+  socketId: string,
+  fallbackName?: string,
+): SessionParticipant {
+  const existing = snapshot.participants[socketId];
+  const now = Date.now();
+  const participant: SessionParticipant = {
+    socketId,
+    userName: existing?.userName || fallbackName?.trim() || "Anonymous Node",
+    role: existing?.role || "participant",
+    joinedAt: existing?.joinedAt ?? now,
+    contributionCount: (existing?.contributionCount ?? 0) + 1,
+    lastContributionAt: now,
+    credits: existing?.credits ?? INITIAL_CREDITS,
+    votes: existing?.votes ?? {},
+  };
+
+  snapshot.participants[socketId] = participant;
+  return participant;
+}
+
+function getQuietParticipantNamesForAnchor(snapshot: SessionSnapshot, now: number) {
+  return getQuietParticipantNames({
+    participants: Object.values(snapshot.participants).map((participant) => ({
+      name: participant.userName,
+      joinedAt: participant.joinedAt,
+      contributionCount: participant.contributionCount,
+      role: participant.role,
+    })),
+    now,
+    maxNames: 6,
+  });
+}
+
+function getTopContributorNames(snapshot: SessionSnapshot, maxNames = 2) {
+  const contributorScores = new Map<string, number>();
+
+  for (const idea of snapshot.state.ideas) {
+    if (!idea.authorName || idea.authorId.startsWith("agent-")) continue;
+    contributorScores.set(
+      idea.authorName,
+      (contributorScores.get(idea.authorName) || 0) + (idea.weight || 1),
+    );
+  }
+
+  return Array.from(contributorScores.entries())
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, maxNames)
+    .map(([name]) => name);
+}
+
+function buildSessionSummary(snapshot: SessionSnapshot) {
+  return {
+    topic: snapshot.state.topic,
+    phase: snapshot.state.phase,
+    topContributors: getTopContributorNames(snapshot, 3),
+    quietParticipants: getQuietParticipantNamesForAnchor(snapshot, Date.now()),
+    ideas: snapshot.state.ideas.slice(-12).map((idea) => ({
+      text: idea.text,
+      cluster: idea.cluster,
+      weight: idea.weight,
+      authorName: idea.authorName,
+    })),
+  };
+}
+
 async function startServer() {
   const app = express();
-  const PORT = Number(process.env.PORT || 3001);
+  const port = Number(process.env.PORT || 3001);
+  const deploymentConfig = getDeploymentConfig();
+  const sessionStore = new SessionStore(deploymentConfig);
+  await sessionStore.init();
 
   console.log("Server starting. GEMINI_API_KEY is", process.env.GEMINI_API_KEY ? "SET" : "NOT SET");
-  logToFile("Server starting. GEMINI_API_KEY is " + (process.env.GEMINI_API_KEY ? "SET" : "NOT SET"));
-  
+  logToFile(`Server starting. GEMINI_API_KEY is ${process.env.GEMINI_API_KEY ? "SET" : "NOT SET"}`);
+
   const server = http.createServer(app);
   const io = new Server(server, {
     cors: {
       origin: "*",
-      methods: ["GET", "POST"]
-    }
+      methods: ["GET", "POST"],
+    },
   });
 
-  const MAX_IDEAS = 200;
+  const shutdownClients: AppRedisClient[] = [];
+  if (deploymentConfig.redis) {
+    const pubClient = createRedisClientFromConfig(deploymentConfig.redis);
+    const subClient = pubClient.duplicate();
+    await Promise.all([pubClient.connect(), subClient.connect()]);
+    io.adapter(createAdapter(pubClient, subClient));
+    shutdownClients.push(pubClient, subClient);
+  }
 
-  // Global State for the Swarm
-  let state = {
-    topic: '',
-    phase: 'divergent', // 'divergent' | 'convergent' | 'forging'
-    ideas: [] as any[],
-    edges: [] as any[],
-    flowData: { nodes: [], edges: [] } as { nodes: any[], edges: any[] },
-    artifactData: null as null | { diagramType: ArtifactDiagramType; title: string; mermaid: string },
-  };
-
-  let pendingIdeas: any[] = [];
-  let pendingUpdates: any[] = [];
-  const participants = new Map<string, {
-    socketId: string;
-    userName: string;
-    role: 'admin' | 'participant';
-    joinedAt: number;
-    contributionCount: number;
-    lastContributionAt: number | null;
-    credits: number;
-    votes: Record<string, number>;
-  }>();
-
-  let lastIdeaTime = Date.now();
-  let lastDirectionSuggestionTime = 0;
-  let lastDirectionSuggestionKey = "";
   let directionSuggestionInFlight = false;
   let anchorLiveSessionPromise: Promise<any> | null = null;
   let currentAnchorAnnouncementId = 0;
   let anchorResponseAnnouncementId = 0;
 
-  function upsertParticipant(socketId: string, userName: string, role: 'admin' | 'participant' = 'participant') {
-    const cleanedName = userName.trim();
-    if (!cleanedName) {
-      return participants.get(socketId) || null;
-    }
-
-    const now = Date.now();
-    const existing = participants.get(socketId);
-    const participant = {
-      socketId,
-      userName: cleanedName,
-      role,
-      joinedAt: existing?.joinedAt ?? now,
-      contributionCount: existing?.contributionCount ?? 0,
-      lastContributionAt: existing?.lastContributionAt ?? null,
-      credits: existing?.credits ?? INITIAL_CREDITS,
-      votes: existing?.votes ?? {},
-    };
-
-    participants.set(socketId, participant);
-    lastIdeaTime = now;
-    return participant;
-  }
-
-  function markParticipantContribution(socketId: string, fallbackName?: string) {
-    const now = Date.now();
-    const existing = participants.get(socketId);
-    const participant = {
-      socketId,
-      userName: existing?.userName || fallbackName?.trim() || 'Anonymous Node',
-      role: existing?.role || 'participant',
-      joinedAt: existing?.joinedAt ?? now,
-      contributionCount: (existing?.contributionCount ?? 0) + 1,
-      lastContributionAt: now,
-      credits: existing?.credits ?? INITIAL_CREDITS,
-      votes: existing?.votes ?? {},
-    };
-
-    participants.set(socketId, participant);
-    lastIdeaTime = now;
-    return participant;
-  }
-
-  function getQuietParticipantNamesForAnchor(now: number) {
-    return getQuietParticipantNames({
-      participants: Array.from(participants.values()).map((participant) => ({
-        name: participant.userName,
-        joinedAt: participant.joinedAt,
-        contributionCount: participant.contributionCount,
-        role: participant.role,
-      })),
-      now,
-      maxNames: 6,
-    });
-  }
-
-  function getTopContributorNames(maxNames = 2) {
-    const contributorScores = new Map<string, number>();
-
-    for (const idea of state.ideas) {
-      if (!idea.authorName || idea.authorId?.startsWith('agent-')) continue;
-      contributorScores.set(
-        idea.authorName,
-        (contributorScores.get(idea.authorName) || 0) + (idea.weight || 1),
-      );
-    }
-
-    return Array.from(contributorScores.entries())
-      .sort((left, right) => right[1] - left[1])
-      .slice(0, maxNames)
-      .map(([name]) => name);
-  }
-
-  function getSessionSnapshot() {
-    return {
-      topic: state.topic,
-      phase: state.phase,
-      topContributors: getTopContributorNames(3),
-      quietParticipants: getQuietParticipantNamesForAnchor(Date.now()),
-      ideas: state.ideas
-        .slice(-12)
-        .map((idea) => ({
-          text: idea.text,
-          cluster: idea.cluster,
-          weight: idea.weight,
-          authorName: idea.authorName,
-      })),
-    };
-  }
-
-  function interruptAnchorAudio(io: Server) {
+  function interruptAnchorAudio(targetIO: Server) {
     currentAnchorAnnouncementId += 1;
-    io.emit("anchor_audio_interrupted", {
+    targetIO.emit("anchor_audio_interrupted", {
       announcementId: currentAnchorAnnouncementId,
       createdAt: Date.now(),
     });
     return currentAnchorAnnouncementId;
   }
 
-  function startAnchorSessionIfNeeded(io: Server) {
+  function startAnchorSessionIfNeeded(targetIO: Server) {
     if (anchorLiveSessionPromise) return anchorLiveSessionPromise;
 
     const newSessionPromise = getAI().live.connect({
@@ -236,7 +258,7 @@ async function startServer() {
           if (message.serverContent?.modelTurn?.parts) {
             for (const part of message.serverContent.modelTurn.parts) {
               if (part.inlineData?.data) {
-                io.emit("anchor_audio_response", {
+                targetIO.emit("anchor_audio_response", {
                   announcementId: anchorResponseAnnouncementId,
                   data: part.inlineData.data,
                   mimeType: part.inlineData.mimeType,
@@ -245,7 +267,7 @@ async function startServer() {
             }
           }
           if (message.serverContent?.interrupted) {
-            io.emit("anchor_audio_interrupted", {
+            targetIO.emit("anchor_audio_interrupted", {
               announcementId: anchorResponseAnnouncementId,
               createdAt: Date.now(),
             });
@@ -257,9 +279,11 @@ async function startServer() {
             anchorLiveSessionPromise = null;
           }
         },
-        onerror: (err: any) => {
-          console.error("Anchor live error:", err.message, err.error);
-          io.emit('error', { message: `Anchor live error: ${err.message || (err.error ? err.error.message : 'Unknown error')}` });
+        onerror: (error: any) => {
+          console.error("Anchor live error:", error.message, error.error);
+          targetIO.emit("error", {
+            message: `Anchor live error: ${error.message || error.error?.message || "Unknown error"}`,
+          });
           if (anchorLiveSessionPromise === newSessionPromise) {
             anchorLiveSessionPromise = null;
           }
@@ -268,7 +292,7 @@ async function startServer() {
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } }
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
         },
         systemInstruction: `You are the live anchor voice for "The Cognitive Swarm".
         Always respond in English only. Never switch to any other language.
@@ -279,45 +303,50 @@ async function startServer() {
     });
 
     anchorLiveSessionPromise = newSessionPromise;
-    anchorLiveSessionPromise.catch((err) => {
-      console.error("Anchor live connect error:", err);
+    anchorLiveSessionPromise.catch((error) => {
+      console.error("Anchor live connect error:", error);
       if (anchorLiveSessionPromise === newSessionPromise) {
         anchorLiveSessionPromise = null;
       }
     });
+
     return anchorLiveSessionPromise;
   }
 
-  async function speakAnchorAnnouncement(io: Server, text: string) {
-    const announcementId = interruptAnchorAudio(io);
+  async function speakAnchorAnnouncement(targetIO: Server, text: string) {
+    const announcementId = interruptAnchorAudio(targetIO);
     anchorResponseAnnouncementId = announcementId;
-    const session = await startAnchorSessionIfNeeded(io);
+    const session = await startAnchorSessionIfNeeded(targetIO);
     await session.sendClientContent({
-      turns: [{
-        role: 'user',
-        parts: [{ text: `Say exactly this line, with playful host energy: ${text}` }],
-      }],
+      turns: [
+        {
+          role: "user",
+          parts: [{ text: `Say exactly this line, with playful host energy: ${text}` }],
+        },
+      ],
       turnComplete: true,
     });
     return announcementId;
   }
 
-  async function findUntouchedDirection() {
-    if (!state.topic || state.ideas.length === 0) {
+  async function findUntouchedDirection(snapshot: SessionSnapshot) {
+    if (!snapshot.state.topic || snapshot.state.ideas.length === 0) {
       return null;
     }
 
     const response = await withTimeout(
       getAI().models.generateContent({
-        model: 'gemini-3.1-flash-lite-preview',
+        model: "gemini-3.1-flash-lite-preview",
         contents: `You are evaluating a live brainstorm.
-      Topic: "${state.topic}".
-      Current phase: "${state.phase}".
-      Existing ideas with clusters: ${JSON.stringify(state.ideas.map(i => ({
-        text: i.text,
-        cluster: i.cluster,
-        weight: i.weight,
-      })))}.
+      Topic: "${snapshot.state.topic}".
+      Current phase: "${snapshot.state.phase}".
+      Existing ideas with clusters: ${JSON.stringify(
+        snapshot.state.ideas.map((idea) => ({
+          text: idea.text,
+          cluster: idea.cluster,
+          weight: idea.weight,
+        })),
+      )}.
 
       Decide whether there is a meaningful direction, lens, or perspective that has not been touched yet.
       Return strict JSON with:
@@ -330,10 +359,10 @@ async function startServer() {
       - suggestion must be empty when shouldSpeak is false.
       - If shouldSpeak is true, suggestion must be a single direct spoken suggestion under 18 words.
       - Prefer materially different angles, not rephrasings of existing ideas.`,
-        config: { responseMimeType: "application/json" }
+        config: { responseMimeType: "application/json" },
       }),
       15000,
-      'findUntouchedDirection'
+      "findUntouchedDirection",
     );
 
     const result = JSON.parse(response.text || "{}");
@@ -351,10 +380,10 @@ async function startServer() {
     const diagramType = inferDiagramType(topic, ideas);
     const diagramLabel = getDiagramLabel(diagramType);
     const summarizedIdeas = ideas
-      .sort((a, b) => (b.weight || 0) - (a.weight || 0))
+      .sort((left, right) => (right.weight || 0) - (left.weight || 0))
       .slice(0, 14)
       .map((idea) => ({
-        cluster: idea.cluster || 'General',
+        cluster: idea.cluster || "General",
         text: idea.text,
         weight: idea.weight || 1,
       }));
@@ -362,7 +391,7 @@ async function startServer() {
     try {
       const response = await withTimeout(
         getAI().models.generateContent({
-          model: 'gemini-3.1-flash-lite-preview',
+          model: "gemini-3.1-flash-lite-preview",
           contents: `You are a diagram synthesis agent.
         Topic: "${topic}".
         Chosen diagram type: "${diagramType}" (${diagramLabel}).
@@ -385,10 +414,10 @@ async function startServer() {
         - For classDiagram: create classes and relationships.
         - For mindmap: create a themed hierarchy.
         - For journey: create stages or moments of experience.`,
-          config: { responseMimeType: "application/json" }
+          config: { responseMimeType: "application/json" },
         }),
         20000,
-        'forgeArtifactFromTopic'
+        "forgeArtifactFromTopic",
       );
 
       const result = JSON.parse(response.text || "{}");
@@ -396,11 +425,7 @@ async function startServer() {
       const title = String(result.title || topic || diagramLabel).trim();
       const generatedType = String(result.diagramType || "").trim() as ArtifactDiagramType;
 
-      if (
-        generatedType !== diagramType ||
-        !mermaid ||
-        !mermaid.startsWith(diagramType)
-      ) {
+      if (generatedType !== diagramType || !mermaid || !mermaid.startsWith(diagramType)) {
         return buildFallbackArtifact(topic, ideas, diagramType);
       }
 
@@ -415,37 +440,161 @@ async function startServer() {
     }
   }
 
-  async function broadcastUntouchedDirection(io: Server, reason: "auto" | "manual") {
-    if (directionSuggestionInFlight || state.phase !== 'divergent') {
+  async function scheduleIdeaResearch(ideaId: string, ideaText: string, authorId: string) {
+    if (authorId.startsWith("agent-")) return;
+
+    getAI()
+      .models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `Find a real-world article, data point, or example that validates or relates to this idea: "${ideaText}". Return a short 3-word summary of the finding.`,
+        config: {
+          tools: [{ googleSearch: {} }],
+        },
+      })
+      .then(async (response) => {
+        const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
+        if (!chunks?.length) {
+          return;
+        }
+
+        const firstChunk = chunks.find((chunk) => chunk.web?.uri);
+        if (!firstChunk?.web?.uri) {
+          return;
+        }
+
+        const url = firstChunk.web.uri;
+        const urlTitle = firstChunk.web.title || (response.text || "").substring(0, 30);
+        const snapshot = await sessionStore.mutate((nextSnapshot) => {
+          const idea = nextSnapshot.state.ideas.find((entry) => entry.id === ideaId);
+          if (!idea) return;
+          idea.url = url;
+          idea.urlTitle = urlTitle;
+        });
+
+        if (snapshot.state.ideas.some((idea) => idea.id === ideaId)) {
+          io.emit("idea_researched", { id: ideaId, url, urlTitle });
+        }
+      })
+      .catch((error) => {
+        console.error("Researcher error:", error);
+        io.emit("error", { message: `Researcher error: ${error.message}` });
+      });
+  }
+
+  async function scheduleIdeaEmbedding(ideaId: string, contents: string) {
+    getAI()
+      .models.embedContent({
+        model: "gemini-embedding-001",
+        contents,
+      })
+      .then(async (response) => {
+        const embedding = response.embeddings?.[0]?.values;
+        if (!embedding) return;
+
+        const targetPosition = projectTo3D(embedding);
+        const snapshot = await sessionStore.mutate((nextSnapshot) => {
+          const idea = nextSnapshot.state.ideas.find((entry) => entry.id === ideaId);
+          if (!idea) return;
+          idea.targetPosition = targetPosition;
+        });
+
+        if (snapshot.state.ideas.some((idea) => idea.id === ideaId)) {
+          io.emit("idea_positioned", { id: ideaId, targetPosition });
+        }
+      })
+      .catch((error) => {
+        console.error("Embedding error:", error);
+      });
+  }
+
+  async function addIdea(params: {
+    id?: string;
+    text: string;
+    cluster?: string;
+    authorId: string;
+    authorName: string;
+    weight?: number;
+    markContribution?: boolean;
+  }) {
+    const sanitizedText = sanitizeIdeaInput(params.text);
+    if (!sanitizedText.valid) {
+      return null;
+    }
+
+    const sanitizedCluster = sanitizeIdeaInput(params.cluster || "General", 100);
+    const now = Date.now();
+    const idea: IdeaRecord = {
+      id: params.id || Math.random().toString(36).substring(2, 9),
+      text: sanitizedText.text,
+      weight: params.weight ?? 1,
+      cluster: sanitizedCluster.text,
+      authorId: params.authorId,
+      authorName: params.authorName || "Anonymous Node",
+      initialPosition: randomIdeaPosition(),
+      targetPosition: null,
+    };
+
+    await sessionStore.mutate((snapshot) => {
+      enforceIdeaLimit(snapshot.state.ideas);
+      snapshot.state.ideas.push(idea);
+      snapshot.metadata.lastIdeaTime = now;
+      if (params.markContribution !== false && !params.authorId.startsWith("agent-")) {
+        markParticipantContribution(snapshot, params.authorId, params.authorName);
+      }
+    });
+
+    io.emit("ideas_batch_added", [idea]);
+    void scheduleIdeaResearch(idea.id, idea.text, idea.authorId);
+    void scheduleIdeaEmbedding(idea.id, idea.text);
+    return idea;
+  }
+
+  async function upsertParticipant(
+    socketId: string,
+    userName: string,
+    role: "admin" | "participant" = "participant",
+  ) {
+    const snapshot = await sessionStore.mutate((nextSnapshot) => {
+      const existingRole = nextSnapshot.participants[socketId]?.role;
+      upsertParticipantRecord(nextSnapshot, socketId, userName, existingRole || role);
+    });
+    return snapshot.participants[socketId] || null;
+  }
+
+  async function broadcastUntouchedDirection(targetIO: Server, reason: "auto" | "manual") {
+    if (directionSuggestionInFlight) {
       return;
     }
 
     directionSuggestionInFlight = true;
     try {
+      const snapshot = await sessionStore.getSnapshot();
+      if (snapshot.state.phase !== "divergent") {
+        return;
+      }
+
       const now = Date.now();
-      const quietNames = getQuietParticipantNamesForAnchor(now);
+      const quietNames = getQuietParticipantNamesForAnchor(snapshot, now);
       const audienceNudge = buildAudienceNudge({
         quietNames,
-        praisedNames: getTopContributorNames(2),
+        praisedNames: getTopContributorNames(snapshot, 2),
       });
 
       let suggestion = "";
       let rationale = "";
-      let kind: 'direction' | 'audience_nudge' = 'direction';
+      let kind: "direction" | "audience_nudge" = "direction";
 
       if (audienceNudge) {
         suggestion = audienceNudge.suggestion.trim();
         rationale = audienceNudge.rationale.trim();
-        kind = 'audience_nudge';
+        kind = "audience_nudge";
       } else {
-        if (state.ideas.length === 0) {
-          logToFile(`No audience nudge or untouched direction available (${reason})`);
+        if (snapshot.state.ideas.length === 0) {
           return;
         }
 
-        const untouchedDirection = await findUntouchedDirection();
+        const untouchedDirection = await findUntouchedDirection(snapshot);
         if (!untouchedDirection) {
-          logToFile(`No untouched direction found (${reason})`);
           return;
         }
 
@@ -453,200 +602,169 @@ async function startServer() {
         rationale = untouchedDirection.rationale.trim();
       }
 
-      const suggestionKey = suggestion.toLowerCase();
-      if (shouldSkipRepeatedSuggestion({
-        reason,
-        suggestion,
-        lastSuggestionKey: lastDirectionSuggestionKey,
-        lastSuggestionTime: lastDirectionSuggestionTime,
-        now,
-      })) {
-        logToFile(`Skipping repeated untouched direction (${reason}): ${suggestion}`);
+      let shouldBroadcast = true;
+      await sessionStore.mutate((nextSnapshot) => {
+        if (
+          shouldSkipRepeatedSuggestion({
+            reason,
+            suggestion,
+            lastSuggestionKey: nextSnapshot.metadata.lastDirectionSuggestionKey,
+            lastSuggestionTime: nextSnapshot.metadata.lastDirectionSuggestionTime,
+            now,
+          })
+        ) {
+          shouldBroadcast = false;
+          return;
+        }
+
+        nextSnapshot.metadata.lastDirectionSuggestionTime = now;
+        nextSnapshot.metadata.lastDirectionSuggestionKey = suggestion.toLowerCase();
+      });
+
+      if (!shouldBroadcast) {
         return;
       }
 
-      lastDirectionSuggestionTime = now;
-      lastDirectionSuggestionKey = suggestionKey;
-      logToFile(`Broadcasting ${kind} (${reason}): ${suggestion}`);
-      io.emit("direction_suggestion", {
+      targetIO.emit("direction_suggestion", {
         suggestion,
         rationale,
         reason,
         kind,
         createdAt: now,
       });
-      await speakAnchorAnnouncement(io, suggestion);
-    } catch (err: any) {
-      console.error("Error finding untouched direction:", err);
-      logToFile("Error finding untouched direction: " + err.message);
+      await speakAnchorAnnouncement(targetIO, suggestion);
+    } catch (error: any) {
+      console.error("Error finding untouched direction:", error);
+      logToFile(`Error finding untouched direction: ${error.message}`);
     } finally {
       directionSuggestionInFlight = false;
     }
   }
 
-  function triggerResearcher(idea: any) {
-    if (idea.authorId.startsWith('agent-')) return;
-    
-    getAI().models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: `Find a real-world article, data point, or example that validates or relates to this idea: "${idea.text}". Return a short 3-word summary of the finding.`,
-      config: {
-        tools: [{ googleSearch: {} }]
-      }
-    }).then(response => {
-      const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
-      if (chunks && chunks.length > 0) {
-        const firstChunk = chunks.find(c => c.web?.uri);
-        if (firstChunk && firstChunk.web) {
-          idea.url = firstChunk.web.uri;
-          idea.urlTitle = firstChunk.web.title || (response.text || '').substring(0, 30);
-          io.emit('idea_researched', { id: idea.id, url: idea.url, urlTitle: idea.urlTitle });
-        }
-      }
-    }).catch(err => {
-      console.error("Researcher error:", err);
-      io.emit('error', { message: `Researcher error: ${err.message}` });
-    });
-  }
-
-  // Synthesizer Agent
   setInterval(async () => {
-    if (!state.topic || participants.size === 0) return;
-    if (state.ideas.length > 3) {
-      console.log("Synthesizer Agent triggered");
-      try {
-        const response = await withTimeout(
-          getAI().models.generateContent({
-            model: 'gemini-3.1-flash-lite-preview',
-            contents: `Here are the current ideas: ${JSON.stringify(state.ideas.map(i => ({id: i.id, text: i.text}))) }.
+    const snapshot = await sessionStore.getSnapshot();
+    if (!snapshot.state.topic || Object.keys(snapshot.participants).length === 0) return;
+    if (snapshot.state.ideas.length <= 3) return;
+
+    try {
+      const response = await withTimeout(
+        getAI().models.generateContent({
+          model: "gemini-3.1-flash-lite-preview",
+          contents: `Here are the current ideas: ${JSON.stringify(
+            snapshot.state.ideas.map((idea) => ({ id: idea.id, text: idea.text })),
+          ) }.
           Find 1-2 strong connections between existing ideas that aren't obvious.
           Return a JSON array of objects with 'sourceId', 'targetId', and 'reason'.`,
-            config: { responseMimeType: "application/json" }
-          }),
-          15000,
-          'synthesizer'
-        );
-        const edges = JSON.parse(response.text || "[]");
-        if (Array.isArray(edges) && edges.length > 0) {
-          edges.forEach(e => {
-            if (e.sourceId && e.targetId) {
-              const exists = state.edges.some(
-                existing => existing.source === e.sourceId && existing.target === e.targetId
-              );
-              if (!exists) {
-                state.edges.push({ source: e.sourceId, target: e.targetId, reason: e.reason });
-              }
-            }
-          });
-          if (state.edges.length > 100) {
-            state.edges = state.edges.slice(-100);
-          }
-          io.emit('edges_updated', state.edges);
+          config: { responseMimeType: "application/json" },
+        }),
+        15000,
+        "synthesizer",
+      );
+
+      const newEdges = JSON.parse(response.text || "[]");
+      let changed = false;
+      const nextSnapshot = await sessionStore.mutate((mutableSnapshot) => {
+        if (!Array.isArray(newEdges)) {
+          return;
         }
-      } catch (e: any) {
-        console.error("Synthesizer error:", e);
-        io.emit('error', { message: `Synthesizer error: ${e.message}` });
+
+        for (const edge of newEdges) {
+          if (!edge?.sourceId || !edge?.targetId) continue;
+          const exists = mutableSnapshot.state.edges.some(
+            (existing) => existing.source === edge.sourceId && existing.target === edge.targetId,
+          );
+          if (exists) continue;
+
+          mutableSnapshot.state.edges.push({
+            source: edge.sourceId,
+            target: edge.targetId,
+            reason: edge.reason,
+          });
+          changed = true;
+        }
+
+        if (mutableSnapshot.state.edges.length > 100) {
+          mutableSnapshot.state.edges = mutableSnapshot.state.edges.slice(-100);
+          changed = true;
+        }
+      });
+
+      if (changed) {
+        io.emit("edges_updated", nextSnapshot.state.edges);
       }
+    } catch (error: any) {
+      console.error("Synthesizer error:", error);
+      io.emit("error", { message: `Synthesizer error: ${error.message}` });
     }
   }, 45000);
 
-  // Devil's Advocate Agent
   setInterval(async () => {
-    if (!state.topic || participants.size === 0) return;
-    if (state.ideas.length > 5) {
-      console.log("Devil's Advocate Agent triggered");
-      try {
-        const response = await withTimeout(
-          getAI().models.generateContent({
-            model: 'gemini-3.1-flash-lite-preview',
-            contents: `The current brainstorming topic is: "${state.topic}".
-          Here are the current ideas: ${JSON.stringify(state.ideas.map(i => i.text))}.
+    const snapshot = await sessionStore.getSnapshot();
+    if (!snapshot.state.topic || Object.keys(snapshot.participants).length === 0) return;
+    if (snapshot.state.ideas.length <= 5) return;
+
+    try {
+      const response = await withTimeout(
+        getAI().models.generateContent({
+          model: "gemini-3.1-flash-lite-preview",
+          contents: `The current brainstorming topic is: "${snapshot.state.topic}".
+          Here are the current ideas: ${JSON.stringify(snapshot.state.ideas.map((idea) => idea.text))}.
           Act as a Devil's Advocate. Find a blind spot, contradiction, or critical flaw in the current ideas.
           Generate ONE challenging question or counter-argument. Keep it to 5-10 words.
           Return JSON with 'idea' and 'category' (use "Critique" as category).`,
-            config: { responseMimeType: "application/json" }
-          }),
-          15000,
-          'devilsAdvocate'
-        );
-        const result = JSON.parse(response.text || "{}");
-        if (result.idea) {
-          const ideaId = Math.random().toString(36).substring(2, 9);
-          const newIdea = {
-            id: ideaId,
-            text: result.idea,
-            weight: 1.5,
-            cluster: 'Critique',
-            authorId: 'agent-critic',
-            authorName: "Devil's Advocate",
-            initialPosition: [(Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20],
-            targetPosition: null as any
-          };
-          if (state.ideas.length >= MAX_IDEAS) {
-            const minIndex = state.ideas.reduce((minIdx, idea, idx, arr) =>
-              (idea.weight || 0) < (arr[minIdx].weight || 0) ? idx : minIdx, 0);
-            state.ideas.splice(minIndex, 1);
-          }
-          state.ideas.push(newIdea);
-          pendingIdeas.push(newIdea);
-          lastIdeaTime = Date.now();
+          config: { responseMimeType: "application/json" },
+        }),
+        15000,
+        "devilsAdvocate",
+      );
 
-          getAI().models.embedContent({
-            model: 'gemini-embedding-001',
-            contents: result.idea,
-          }).then(embRes => {
-            const embedding = embRes.embeddings?.[0]?.values;
-            if (embedding) {
-              const targetPosition = projectTo3D(embedding);
-              newIdea.targetPosition = targetPosition;
-              io.emit('idea_positioned', { id: ideaId, targetPosition });
-            }
-          }).catch(err => console.error("Embedding error:", err));
-        }
-      } catch (e: any) {
-        console.error("Devil's Advocate error:", e);
-        io.emit('error', { message: `Devil's Advocate error: ${e.message}` });
-      }
+      const result = JSON.parse(response.text || "{}");
+      if (!result.idea) return;
+
+      await addIdea({
+        text: result.idea,
+        cluster: result.category || "Critique",
+        authorId: "agent-critic",
+        authorName: "Devil's Advocate",
+        weight: 1.5,
+        markContribution: false,
+      });
+    } catch (error: any) {
+      console.error("Devil's Advocate error:", error);
+      io.emit("error", { message: `Devil's Advocate error: ${error.message}` });
     }
   }, 90000);
 
-  // Batch broadcast every 1.5 seconds
-  setInterval(() => {
-    if (pendingIdeas.length > 0) {
-      io.emit("ideas_batch_added", pendingIdeas);
-      pendingIdeas = [];
-    }
-    if (pendingUpdates.length > 0) {
-      const uniqueUpdates = dedupeById(pendingUpdates);
-      io.emit("ideas_batch_updated", uniqueUpdates);
-      pendingUpdates = [];
-    }
-  }, 1500);
-
-  setInterval(() => {
-    if (shouldAutoBroadcastSuggestion({
-      phase: state.phase,
-      ideaCount: state.ideas.length,
-      quietParticipantCount: getQuietParticipantNamesForAnchor(Date.now()).length,
-      lastIdeaTime,
-      lastDirectionSuggestionTime,
-      now: Date.now(),
-    })) {
-      broadcastUntouchedDirection(io, "auto");
+  setInterval(async () => {
+    const snapshot = await sessionStore.getSnapshot();
+    if (
+      shouldAutoBroadcastSuggestion({
+        phase: snapshot.state.phase,
+        ideaCount: snapshot.state.ideas.length,
+        quietParticipantCount: getQuietParticipantNamesForAnchor(snapshot, Date.now()).length,
+        lastIdeaTime: snapshot.metadata.lastIdeaTime,
+        lastDirectionSuggestionTime: snapshot.metadata.lastDirectionSuggestionTime,
+        now: Date.now(),
+      })
+    ) {
+      void broadcastUntouchedDirection(io, "auto");
     }
   }, 5000);
 
   io.on("connection", (socket) => {
     console.log("Client connected:", socket.id);
-    
-    // Send initial state
-    socket.emit("state_sync", state);
+
+    void sessionStore.getSnapshot().then((snapshot) => {
+      socket.emit("state_sync", snapshot.state);
+    });
 
     let liveSessionPromise: Promise<any> | null = null;
     let audioActive = false;
     let videoActive = false;
     let audioStreamStarted = false;
     let pendingSessionClose: NodeJS.Timeout | null = null;
+    let pendingAudioChunks: string[] = [];
+    let audioChunkCount = 0;
 
     const clearPendingSessionClose = () => {
       if (pendingSessionClose) {
@@ -660,140 +778,132 @@ async function startServer() {
       pendingSessionClose = setTimeout(() => {
         pendingSessionClose = null;
         if (!audioActive && !videoActive && liveSessionPromise) {
-          liveSessionPromise.then(s => s.close()).catch(err => console.error(err));
+          liveSessionPromise.then((session) => session.close()).catch((error) => console.error(error));
           liveSessionPromise = null;
         }
       }, delayMs);
     };
 
+    const stopSessionIfNeeded = () => {
+      clearPendingSessionClose();
+      if (!audioActive && !videoActive && liveSessionPromise) {
+        liveSessionPromise.then((session) => session.close()).catch((error) => console.error(error));
+        liveSessionPromise = null;
+      }
+    };
+
     const startSessionIfNeeded = (topic: string, userName: string) => {
       if (liveSessionPromise) return;
-      
+
       const newSessionPromise = getAI().live.connect({
         model: "gemini-2.5-flash-native-audio-preview-09-2025",
         callbacks: {
           onopen: () => {
             console.log("Gemini Live Connected for", socket.id);
-            logToFile("Gemini Live Connected for " + socket.id);
+            logToFile(`Gemini Live Connected for ${socket.id}`);
             socket.emit("audio_session_started");
           },
           onmessage: async (message: LiveServerMessage) => {
-            // console.log("Received message from Gemini:", Object.keys(message));
-            if (message.serverContent?.modelTurn) {
-              logToFile("Received modelTurn: " + JSON.stringify(message.serverContent.modelTurn).substring(0, 200));
-              const parts = message.serverContent.modelTurn.parts;
-              if (parts) {
-                for (const part of parts) {
-                  emitInlineAudio(socket, "audio_response", part.inlineData);
-                }
+            if (message.serverContent?.modelTurn?.parts) {
+              logToFile(`Received modelTurn: ${JSON.stringify(message.serverContent.modelTurn).substring(0, 200)}`);
+              for (const part of message.serverContent.modelTurn.parts) {
+                emitInlineAudio(socket, "audio_response", part.inlineData);
               }
             }
+
             if (message.serverContent?.interrupted) {
               logToFile("Received interrupted from Gemini");
               socket.emit("audio_interrupted");
             }
 
-            // Handle tool calls
-            if (message.toolCall) {
-              logToFile("Received toolCall: " + JSON.stringify(message.toolCall));
-              const calls = message.toolCall.functionCalls;
-              if (calls) {
-                const functionResponses: any[] = [];
-                for (const call of calls) {
-                  logToFile("Processing function call: " + call.name + " " + JSON.stringify(call.args));
-                  if (call.name === 'extractIdea') {
-                    const args = call.args as any;
-                    const ideaId = Math.random().toString(36).substring(2, 9);
-                    const authorName = userName || participants.get(socket.id)?.userName || 'Anonymous Node';
-                    const newIdea = {
-                      id: ideaId,
-                      text: args.idea,
-                      weight: 1,
-                      cluster: args.category || 'General',
-                      authorId: socket.id,
-                      authorName,
-                      initialPosition: [(Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20],
-                      targetPosition: null as any
-                    };
-                    if (state.ideas.length >= MAX_IDEAS) {
-                      const minIndex = state.ideas.reduce((minIdx, idea, idx, arr) =>
-                        (idea.weight || 0) < (arr[minIdx].weight || 0) ? idx : minIdx, 0);
-                      state.ideas.splice(minIndex, 1);
-                    }
-                    state.ideas.push(newIdea);
-                    pendingIdeas.push(newIdea);
-                    markParticipantContribution(socket.id, authorName);
-                    triggerResearcher(newIdea);
+            if (!message.toolCall?.functionCalls) {
+              return;
+            }
 
-                    // Fetch embedding asynchronously
-                    getAI().models.embedContent({
-                      model: 'gemini-embedding-001',
-                      contents: args.idea,
-                    }).then(response => {
-                      const embedding = response.embeddings?.[0]?.values;
-                      if (embedding) {
-                        const targetPosition = projectTo3D(embedding);
-                        newIdea.targetPosition = targetPosition;
-                        io.emit('idea_positioned', { id: ideaId, targetPosition });
-                      }
-                    }).catch(err => console.error("Embedding error:", err));
+            logToFile(`Received toolCall: ${JSON.stringify(message.toolCall)}`);
+            const functionResponses: any[] = [];
 
-                    functionResponses.push({
-                      id: call.id,
-                      name: call.name,
-                      response: { result: "Idea extracted successfully" }
-                    });
-                  } else if (call.name === 'generateMermaid') {
-                    const args = call.args as any;
-                    io.emit('update_mermaid', args.code);
-                    functionResponses.push({
-                      id: call.id,
-                      name: call.name,
-                      response: { result: "Mermaid diagram generated successfully" }
-                    });
-                  } else if (call.name === 'getIdeas') {
-                    const ideasList = state.ideas.map(i => ({ text: i.text, cluster: i.cluster, weight: i.weight }));
-                    functionResponses.push({
-                      id: call.id,
-                      name: call.name,
-                      response: { ideas: ideasList }
-                    });
-                  } else if (call.name === 'getSessionSnapshot') {
-                    functionResponses.push({
-                      id: call.id,
-                      name: call.name,
-                      response: getSessionSnapshot(),
-                    });
-                  }
-                }
+            for (const call of message.toolCall.functionCalls) {
+              logToFile(`Processing function call: ${call.name} ${JSON.stringify(call.args)}`);
 
-                if (liveSessionPromise) {
-                  liveSessionPromise.then(s => s.sendToolResponse({ functionResponses })).catch(err => console.error("Error sending tool response:", err));
-                }
+              if (call.name === "extractIdea") {
+                const args = call.args as { idea?: string; category?: string };
+                const addedIdea = await addIdea({
+                  text: args.idea || "",
+                  cluster: args.category || "General",
+                  authorId: socket.id,
+                  authorName: userName || "Anonymous Node",
+                });
+
+                functionResponses.push({
+                  id: call.id,
+                  name: call.name,
+                  response: {
+                    result: addedIdea ? "Idea extracted successfully" : "Idea extraction skipped",
+                  },
+                });
+              } else if (call.name === "generateMermaid") {
+                const args = call.args as { code?: string };
+                io.emit("update_mermaid", args.code);
+                functionResponses.push({
+                  id: call.id,
+                  name: call.name,
+                  response: { result: "Mermaid diagram generated successfully" },
+                });
+              } else if (call.name === "getIdeas") {
+                const snapshot = await sessionStore.getSnapshot();
+                functionResponses.push({
+                  id: call.id,
+                  name: call.name,
+                  response: {
+                    ideas: snapshot.state.ideas.map((idea) => ({
+                      text: idea.text,
+                      cluster: idea.cluster,
+                      weight: idea.weight,
+                    })),
+                  },
+                });
+              } else if (call.name === "getSessionSnapshot") {
+                const snapshot = await sessionStore.getSnapshot();
+                functionResponses.push({
+                  id: call.id,
+                  name: call.name,
+                  response: buildSessionSummary(snapshot),
+                });
               }
+            }
+
+            if (liveSessionPromise) {
+              liveSessionPromise
+                .then((session) => session.sendToolResponse({ functionResponses }))
+                .catch((error) => console.error("Error sending tool response:", error));
             }
           },
           onclose: (event) => {
             console.log("Gemini Live Disconnected for", socket.id, "Code:", event?.code, "Reason:", event?.reason);
-            logToFile("Gemini Live Disconnected for " + socket.id + " Code: " + event?.code + " Reason: " + event?.reason);
+            logToFile(`Gemini Live Disconnected for ${socket.id} Code: ${event?.code} Reason: ${event?.reason}`);
             socket.emit("audio_session_closed");
             if (liveSessionPromise === newSessionPromise) {
               liveSessionPromise = null;
             }
           },
-          onerror: (err: any) => {
-            console.error("Gemini Live Error for", socket.id, err.message, err.error);
-            logToFile("Gemini Live Error for " + socket.id + ": " + err.message + " - " + (err.error ? err.error.message : ""));
-            socket.emit('error', { message: `Gemini Live Error: ${err.message || (err.error ? err.error.message : 'Unknown error')}` });
+          onerror: (error: any) => {
+            console.error("Gemini Live Error for", socket.id, error.message, error.error);
+            logToFile(
+              `Gemini Live Error for ${socket.id}: ${error.message} - ${error.error ? error.error.message : ""}`,
+            );
+            socket.emit("error", {
+              message: `Gemini Live Error: ${error.message || error.error?.message || "Unknown error"}`,
+            });
             if (liveSessionPromise === newSessionPromise) {
               liveSessionPromise = null;
             }
-          }
+          },
         },
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } }
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
           },
           systemInstruction: `You are the playful live anchor of "The Cognitive Swarm".
           Topic: "${topic}". Current speaker: ${userName}.
@@ -815,105 +925,106 @@ async function startServer() {
           - If praising contributors or inviting quiet participants, use names from the session tools rather than inventing them.
           - Be playful, but do not roast or embarrass people.
           - If interrupted, stop immediately and let the speaker take the floor.`,
-          tools: [{
-            functionDeclarations: [
-              {
-                name: 'extractIdea',
-                description: 'Extracts a brainstorming idea from the user audio.',
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {
-                    idea: { type: Type.STRING, description: 'A concise, 3-7 word summary of the idea.' },
-                    category: { type: Type.STRING, description: 'A 1-2 word category or cluster name.' }
+          tools: [
+            {
+              functionDeclarations: [
+                {
+                  name: "extractIdea",
+                  description: "Extracts a brainstorming idea from the user audio.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      idea: { type: Type.STRING, description: "A concise, 3-7 word summary of the idea." },
+                      category: { type: Type.STRING, description: "A 1-2 word category or cluster name." },
+                    },
+                    required: ["idea", "category"],
                   },
-                  required: ['idea', 'category']
-                }
-              },
-              {
-                name: 'generateMermaid',
-                description: 'Generates a Mermaid.js diagram based on the current ideas.',
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {
-                    code: { type: Type.STRING, description: 'The raw Mermaid.js code (e.g., graph TD; A-->B;)' }
+                },
+                {
+                  name: "generateMermaid",
+                  description: "Generates a Mermaid.js diagram based on the current ideas.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      code: { type: Type.STRING, description: "The raw Mermaid.js code (e.g., graph TD; A-->B;)." },
+                    },
+                    required: ["code"],
                   },
-                  required: ['code']
-                }
-              },
-              {
-                name: 'getIdeas',
-                description: 'Gets the current list of brainstormed ideas and their weights.',
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {
-                    format: { type: Type.STRING, description: 'The format to return (e.g., "json")' }
-                  }
-                }
-              },
-              {
-                name: 'getSessionSnapshot',
-                description: 'Gets the current topic, phase, recent ideas, top contributors, and quieter participants.',
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {
-                    detailLevel: { type: Type.STRING, description: 'Optional level of detail, such as "brief" or "full".' }
-                  }
-                }
-              }
-            ]
-          }]
-        }
+                },
+                {
+                  name: "getIdeas",
+                  description: "Gets the current list of brainstormed ideas and their weights.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      format: { type: Type.STRING, description: 'The format to return (e.g., "json").' },
+                    },
+                  },
+                },
+                {
+                  name: "getSessionSnapshot",
+                  description: "Gets the current topic, phase, recent ideas, top contributors, and quieter participants.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      detailLevel: {
+                        type: Type.STRING,
+                        description: 'Optional level of detail, such as "brief" or "full".',
+                      },
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        },
       });
-      
+
       liveSessionPromise = newSessionPromise;
-      
-      liveSessionPromise.catch(err => {
-        console.error("Live session connect error:", err);
-        logToFile("Live session connect error: " + err.message);
-        socket.emit('error', { message: `Live session connect error: ${err.message}` });
+      liveSessionPromise.catch((error) => {
+        console.error("Live session connect error:", error);
+        logToFile(`Live session connect error: ${error.message}`);
+        socket.emit("error", { message: `Live session connect error: ${error.message}` });
         if (liveSessionPromise === newSessionPromise) {
           liveSessionPromise = null;
         }
       });
     };
 
-    const stopSessionIfNeeded = () => {
-      clearPendingSessionClose();
-      if (!audioActive && !videoActive && liveSessionPromise) {
-        liveSessionPromise.then(s => s.close()).catch(err => console.error(err));
-        liveSessionPromise = null;
+    socket.on("register_participant", async (data: { userName: string; role: "admin" | "participant" }) => {
+      const participant = await upsertParticipant(socket.id, data.userName, data.role);
+      if (participant) {
+        socket.emit("credits_updated", { credits: participant.credits, votes: participant.votes });
       }
-    };
-
-    socket.on("register_participant", (data: { userName: string, role: 'admin' | 'participant' }) => {
-      upsertParticipant(socket.id, data.userName, data.role);
     });
 
     socket.on("interrupt_anchor", () => {
       interruptAnchorAudio(io);
     });
 
-    socket.on("start_audio_session", (data: { topic: string, userName: string }) => {
-      logToFile("start_audio_session received for " + socket.id);
+    socket.on("start_audio_session", async (data: { topic: string; userName: string }) => {
+      logToFile(`start_audio_session received for ${socket.id}`);
       audioActive = true;
       audioStreamStarted = false;
       clearPendingSessionClose();
       interruptAnchorAudio(io);
-      upsertParticipant(socket.id, data.userName, participants.get(socket.id)?.role || 'participant');
+      await upsertParticipant(socket.id, data.userName);
       startSessionIfNeeded(data.topic, data.userName);
     });
 
     socket.on("stop_audio_session", () => {
-      logToFile("stop_audio_session received for " + socket.id);
+      logToFile(`stop_audio_session received for ${socket.id}`);
       audioActive = false;
       if (liveSessionPromise && audioStreamStarted) {
-        liveSessionPromise.then(s => {
-          logToFile("Sending audioStreamEnd for " + socket.id);
-          s.sendRealtimeInput({ audioStreamEnd: true });
-        }).catch(err => {
-          console.error("Error sending audio stream end:", err);
-          logToFile("Error sending audio stream end: " + err.message);
-        });
+        liveSessionPromise
+          .then((session) => {
+            logToFile(`Sending audioStreamEnd for ${socket.id}`);
+            session.sendRealtimeInput({ audioStreamEnd: true });
+          })
+          .catch((error) => {
+            console.error("Error sending audio stream end:", error);
+            logToFile(`Error sending audio stream end: ${error.message}`);
+          });
         scheduleSessionClose();
       } else {
         stopSessionIfNeeded();
@@ -921,14 +1032,14 @@ async function startServer() {
     });
 
     socket.on("suggest_direction", () => {
-      logToFile("suggest_direction received for " + socket.id);
-      broadcastUntouchedDirection(io, "manual");
+      logToFile(`suggest_direction received for ${socket.id}`);
+      void broadcastUntouchedDirection(io, "manual");
     });
 
-    socket.on("start_video_session", (data: { topic: string, userName: string }) => {
+    socket.on("start_video_session", async (data: { topic: string; userName: string }) => {
       videoActive = true;
       clearPendingSessionClose();
-      upsertParticipant(socket.id, data.userName, participants.get(socket.id)?.role || 'participant');
+      await upsertParticipant(socket.id, data.userName);
       startSessionIfNeeded(data.topic, data.userName);
     });
 
@@ -937,235 +1048,222 @@ async function startServer() {
       stopSessionIfNeeded();
     });
 
-    let audioChunkCount = 0;
-    let pendingAudioChunks: string[] = [];
     socket.on("text_chunk", (text: string) => {
       logToFile(`Received text chunk: ${text}`);
       interruptAnchorAudio(io);
       if (liveSessionPromise) {
-        liveSessionPromise.then(s => {
-          s.sendClientContent({
-            turns: [{ role: 'user', parts: [{ text }] }],
-            turnComplete: true
+        liveSessionPromise
+          .then((session) => {
+            session.sendClientContent({
+              turns: [{ role: "user", parts: [{ text }] }],
+              turnComplete: true,
+            });
+          })
+          .catch((error) => {
+            console.error("Error sending text chunk:", error);
+            logToFile(`Error sending text chunk: ${error.message}`);
           });
-        }).catch(err => {
-          console.error("Error sending text chunk:", err);
-          logToFile("Error sending text chunk: " + err.message);
-        });
       }
     });
 
     socket.on("audio_chunk", (base64Data: string) => {
-      audioChunkCount++;
+      audioChunkCount += 1;
       audioStreamStarted = true;
       clearPendingSessionClose();
-      // Don't interrupt anchor on every chunk — it kills the user's own
-      // Gemini response playback. Anchor is already interrupted when
-      // the audio session starts (start_audio_session handler).
+
       if (audioChunkCount % 10 === 0) {
         logToFile(`Received 10 audio chunks from ${socket.id}`);
       }
+
       if (liveSessionPromise) {
         const buffered = pendingAudioChunks;
         pendingAudioChunks = [];
-        liveSessionPromise.then(s => {
-          for (const chunk of buffered) {
-            s.sendRealtimeInput({ audio: { data: chunk, mimeType: 'audio/pcm;rate=16000' } });
-          }
-          s.sendRealtimeInput({
-            audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
+        liveSessionPromise
+          .then((session) => {
+            for (const chunk of buffered) {
+              session.sendRealtimeInput({ audio: { data: chunk, mimeType: "audio/pcm;rate=16000" } });
+            }
+            session.sendRealtimeInput({
+              audio: { data: base64Data, mimeType: "audio/pcm;rate=16000" },
+            });
+          })
+          .catch((error) => {
+            pendingAudioChunks = [...buffered, base64Data, ...pendingAudioChunks].slice(0, 50);
+            console.error("Error sending audio chunk:", error);
+            logToFile(`Error sending audio chunk, re-queued: ${error.message}`);
           });
-        }).catch(err => {
-          // Re-queue chunks on failure so they aren't lost
-          pendingAudioChunks = [...buffered, base64Data, ...pendingAudioChunks].slice(0, 50);
-          console.error("Error sending audio chunk:", err);
-          logToFile("Error sending audio chunk, re-queued: " + err.message);
-        });
-      } else {
-        if (pendingAudioChunks.length < 50) {
-          pendingAudioChunks.push(base64Data);
-        }
+      } else if (pendingAudioChunks.length < 50) {
+        pendingAudioChunks.push(base64Data);
       }
     });
 
     socket.on("video_chunk", (base64Data: string) => {
       clearPendingSessionClose();
       if (liveSessionPromise) {
-        liveSessionPromise.then(s => {
-          s.sendRealtimeInput({
-            video: { data: base64Data, mimeType: 'image/jpeg' }
+        liveSessionPromise
+          .then((session) => {
+            session.sendRealtimeInput({
+              video: { data: base64Data, mimeType: "image/jpeg" },
+            });
+          })
+          .catch((error) => {
+            console.error("Error sending video chunk:", error);
+            logToFile(`Error sending video chunk: ${error.message}`);
           });
-        }).catch(err => {
-          console.error("Error sending video chunk:", err);
-          logToFile("Error sending video chunk: " + err.message);
-        });
       }
     });
 
-    // Update topic
-    socket.on("set_topic", (topic: string) => {
-      if (!isAdmin(participants.get(socket.id))) return;
-      if (typeof topic !== 'string' || !topic.trim()) return;
-      state.topic = topic.trim();
-      io.emit("topic_updated", state.topic);
+    socket.on("set_topic", async (topic: string) => {
+      const snapshot = await sessionStore.getSnapshot();
+      if (!isAdmin(snapshot.participants[socket.id])) return;
+      if (typeof topic !== "string" || !topic.trim()) return;
+
+      const nextSnapshot = await sessionStore.mutate((mutableSnapshot) => {
+        mutableSnapshot.state.topic = topic.trim();
+      });
+      io.emit("topic_updated", nextSnapshot.state.topic);
     });
 
-    // Ingestion Task: Receive new ideas from clients (extracted via Gemini)
-    socket.on("add_idea", (idea: { id?: string, text: string, cluster: string, authorName?: string }) => {
-      const sanitized = sanitizeIdeaInput(idea.text);
-      if (!sanitized.valid) return;
-      const clusterSanitized = sanitizeIdeaInput(idea.cluster || 'General', 100);
-
-      const initialPosition = [
-        (Math.random() - 0.5) * 20,
-        (Math.random() - 0.5) * 20,
-        (Math.random() - 0.5) * 20
-      ];
-
-      const newIdea = {
-        id: idea.id || Math.random().toString(36).substring(2, 9),
-        text: sanitized.text,
-        weight: 1, // Initial weight
-        cluster: clusterSanitized.text,
+    socket.on("add_idea", async (idea: { id?: string; text: string; cluster: string; authorName?: string }) => {
+      await addIdea({
+        id: idea.id,
+        text: idea.text,
+        cluster: idea.cluster,
         authorId: socket.id,
-        authorName: idea.authorName || 'Anonymous Node',
-        initialPosition,
-        targetPosition: null // Will be updated after embedding
-      };
-      
-      if (state.ideas.length >= MAX_IDEAS) {
-        const minIndex = state.ideas.reduce((minIdx, idea, idx, arr) =>
-          (idea.weight || 0) < (arr[minIdx].weight || 0) ? idx : minIdx, 0);
-        state.ideas.splice(minIndex, 1);
-      }
-      state.ideas.push(newIdea);
-      pendingIdeas.push(newIdea);
-      markParticipantContribution(socket.id, newIdea.authorName);
-      triggerResearcher(newIdea);
+        authorName: idea.authorName || "Anonymous Node",
+      });
     });
 
-    // Update idea embedding
-    socket.on("update_idea_embedding", (data: { id: string, embedding: number[] }) => {
-      const existingIdea = state.ideas.find(i => i.id === data.id);
-      if (existingIdea) {
-        const targetPosition = projectTo3D(data.embedding);
-        existingIdea.targetPosition = targetPosition;
-        io.emit('idea_positioned', { id: existingIdea.id, targetPosition });
-      }
-    });
-
-    // Consensus Mediator Task: Idea Voting (server-validated quadratic cost)
-    socket.on("update_idea_weight", (data: { ideaId: string, weightChange: number }) => {
-      const participant = participants.get(socket.id);
-      if (!participant) return;
-      const idea = state.ideas.find(i => i.id === data.ideaId);
-      if (!idea) return;
-
-      const currentVotes = participant.votes[data.ideaId] || 0;
-      const result = validateVote({
-        currentVotes,
-        credits: participant.credits,
-        delta: data.weightChange,
+    socket.on("update_idea_embedding", async (data: { id: string; embedding: number[] }) => {
+      const targetPosition = projectTo3D(data.embedding);
+      const snapshot = await sessionStore.mutate((mutableSnapshot) => {
+        const idea = mutableSnapshot.state.ideas.find((entry) => entry.id === data.id);
+        if (!idea) return;
+        idea.targetPosition = targetPosition;
       });
 
-      if (!result.allowed) return;
-
-      participant.credits -= result.cost;
-      participant.votes[data.ideaId] = result.newVotes;
-      idea.weight = (idea.weight || 0) + data.weightChange;
-      if (idea.weight < 0) idea.weight = 0;
-
-      const existingUpdateIndex = pendingUpdates.findIndex(u => u.id === data.ideaId);
-      if (existingUpdateIndex >= 0) {
-        pendingUpdates[existingUpdateIndex] = idea;
-      } else {
-        pendingUpdates.push(idea);
+      if (snapshot.state.ideas.some((idea) => idea.id === data.id)) {
+        io.emit("idea_positioned", { id: data.id, targetPosition });
       }
-
-      socket.emit('credits_updated', { credits: participant.credits, votes: participant.votes });
-      io.emit('idea_weight_updated', { ideaId: data.ideaId, weight: idea.weight });
     });
 
-    // Edit Idea Task
-    socket.on("edit_idea", (data: { id: string, text: string, cluster: string, textChanged?: boolean }) => {
+    socket.on("update_idea_weight", async (data: { ideaId: string; weightChange: number }) => {
+      let updatedWeight: number | null = null;
+      let creditsPayload: { credits: number; votes: Record<string, number> } | null = null;
+
+      await sessionStore.mutate((snapshot) => {
+        const participant = snapshot.participants[socket.id];
+        if (!participant) return;
+
+        const idea = snapshot.state.ideas.find((entry) => entry.id === data.ideaId);
+        if (!idea) return;
+
+        const currentVotes = participant.votes[data.ideaId] || 0;
+        const result = validateVote({
+          currentVotes,
+          credits: participant.credits,
+          delta: data.weightChange,
+        });
+        if (!result.allowed) return;
+
+        participant.credits -= result.cost;
+        participant.votes[data.ideaId] = result.newVotes;
+        idea.weight = Math.max(0, (idea.weight || 0) + data.weightChange);
+
+        creditsPayload = { credits: participant.credits, votes: participant.votes };
+        updatedWeight = idea.weight;
+      });
+
+      if (!creditsPayload || updatedWeight === null) return;
+      socket.emit("credits_updated", creditsPayload);
+      io.emit("idea_weight_updated", { ideaId: data.ideaId, weight: updatedWeight });
+      io.emit("ideas_batch_updated", [{ id: data.ideaId, weight: updatedWeight }]);
+    });
+
+    socket.on("edit_idea", async (data: { id: string; text: string; cluster: string; textChanged?: boolean }) => {
       const sanitizedText = sanitizeIdeaInput(data.text);
       if (!sanitizedText.valid) return;
-      const sanitizedCluster = sanitizeIdeaInput(data.cluster || 'General', 100);
+      const sanitizedCluster = sanitizeIdeaInput(data.cluster || "General", 100);
 
-      const idea = state.ideas.find(i => i.id === data.id);
-      if (idea) {
+      let updatedIdea: IdeaRecord | null = null;
+      const snapshot = await sessionStore.mutate((mutableSnapshot) => {
+        const idea = mutableSnapshot.state.ideas.find((entry) => entry.id === data.id);
+        if (!idea) return;
+
         idea.text = sanitizedText.text;
         idea.cluster = sanitizedCluster.text;
-        
-        if (data.textChanged) {
-          getAI().models.embedContent({
-            model: 'gemini-embedding-001',
-            contents: data.text,
-          }).then(response => {
-            const embedding = response.embeddings?.[0]?.values;
-            if (embedding) {
-              const targetPosition = projectTo3D(embedding);
-              idea.targetPosition = targetPosition;
-              io.emit('idea_positioned', { id: idea.id, targetPosition });
-            }
-          }).catch(err => console.error("Embedding error:", err));
-        }
-        
-        const existingUpdateIndex = pendingUpdates.findIndex(u => u.id === data.id);
-        if (existingUpdateIndex >= 0) {
-          pendingUpdates[existingUpdateIndex] = idea;
-        } else {
-          pendingUpdates.push(idea);
-        }
+        updatedIdea = { ...idea };
+      });
+
+      if (!snapshot.state.ideas.some((idea) => idea.id === data.id) || !updatedIdea) return;
+      io.emit("ideas_batch_updated", [updatedIdea]);
+
+      if (data.textChanged) {
+        void scheduleIdeaEmbedding(data.id, sanitizedText.text);
       }
     });
 
-    // Visual Scribe Task: Update React Flow Diagram
-    socket.on("update_flow", (data: { nodes: any[], edges: any[] }) => {
-      state.flowData = data;
-      io.emit("flow_updated", state.flowData);
+    socket.on("update_flow", async (data: { nodes: any[]; edges: any[] }) => {
+      const snapshot = await sessionStore.mutate((mutableSnapshot) => {
+        mutableSnapshot.state.flowData = data;
+      });
+      io.emit("flow_updated", snapshot.state.flowData);
     });
 
     socket.on("forge_artifact", async () => {
       try {
+        const snapshot = await sessionStore.getSnapshot();
         const artifact = await forgeArtifactFromTopic(
-          state.topic || 'Brainstorming Session',
-          state.ideas.map((idea) => ({
+          snapshot.state.topic || "Brainstorming Session",
+          snapshot.state.ideas.map((idea) => ({
             text: idea.text,
             cluster: idea.cluster,
             weight: idea.weight,
           })),
         );
-        state.artifactData = artifact;
+        await sessionStore.mutate((mutableSnapshot) => {
+          mutableSnapshot.state.artifactData = artifact;
+        });
         io.emit("artifact_updated", artifact);
       } catch (error: any) {
         console.error("Artifact forge failed:", error);
-        socket.emit('error', { message: error.message || 'Failed to forge topic-aware artifact.' });
+        socket.emit("error", { message: error.message || "Failed to forge topic-aware artifact." });
       }
     });
 
-    // Phase transition
-    socket.on("set_phase", (phase: string) => {
-      if (!isAdmin(participants.get(socket.id))) return;
+    socket.on("set_phase", async (phase: string) => {
+      const snapshot = await sessionStore.getSnapshot();
+      if (!isAdmin(snapshot.participants[socket.id])) return;
       if (!isValidPhase(phase)) return;
-      state.phase = phase;
-      io.emit("phase_changed", state.phase);
+
+      const nextSnapshot = await sessionStore.mutate((mutableSnapshot) => {
+        mutableSnapshot.state.phase = phase;
+      });
+      io.emit("phase_changed", nextSnapshot.state.phase);
     });
 
     socket.on("disconnect", () => {
       console.log("Client disconnected:", socket.id);
       clearPendingSessionClose();
       stopSessionIfNeeded();
-      participants.delete(socket.id);
+      void sessionStore.removeParticipant(socket.id);
     });
   });
 
-  // API routes FIRST
-  app.get("/api/health", (req, res) => {
+  app.get("/api/health", (_req, res) => {
     res.json({ status: "ok" });
   });
 
-  // Vite middleware for development
+  app.get("/api/ready", (_req, res) => {
+    const status = sessionStore.getStatus();
+    res.status(status.ready ? 200 : 503).json({
+      status: status.ready ? "ok" : "degraded",
+      storage: status.storage,
+      durablePersistence: status.durablePersistence,
+      details: status.details,
+    });
+  });
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1184,14 +1282,30 @@ async function startServer() {
       res.type("html").send(buildDevSpaHtml());
     });
   } else {
-    app.use(express.static('dist'));
-    app.get("*", (req, res) => {
+    app.use(express.static("dist"));
+    app.get("*", (_req, res) => {
       res.sendFile(path.resolve(process.cwd(), "dist", "index.html"));
     });
   }
 
-  server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  const shutdown = async () => {
+    await Promise.allSettled(shutdownClients.map((client) => client.quit()));
+    await sessionStore.close();
+    if (anchorLiveSessionPromise) {
+      await anchorLiveSessionPromise.then((session) => session.close()).catch(() => undefined);
+    }
+    server.close();
+  };
+
+  process.on("SIGTERM", () => {
+    void shutdown();
+  });
+  process.on("SIGINT", () => {
+    void shutdown();
+  });
+
+  server.listen(port, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${port}`);
   });
 }
 

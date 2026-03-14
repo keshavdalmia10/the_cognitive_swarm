@@ -6,3 +6,9 @@ coverage/
 *.log
 .env*
 !.env.example
+.gcloud-config/
+.terraform/
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.backup
+infra/terraform/environments/*.tfvars
+!infra/terraform/environments/*.tfvars.example

@@ -1,0 +1,13 @@
+.git
+.github
+build
+dist
+coverage
+docs
+infra
+node_modules
+tests
+*.log
+.env
+.env.local
+.env.production

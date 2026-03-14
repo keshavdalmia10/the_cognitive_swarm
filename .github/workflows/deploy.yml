@@ -1,0 +1,135 @@
+name: deploy-cloud-run
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION }}
+  REPOSITORY: ${{ vars.ARTIFACT_REGISTRY_REPOSITORY }}
+  IMAGE_NAME: the-cognitive-swarm
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  build:
+    runs-on: ubuntu-latest
+    needs: validate
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.DEPLOY_WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker auth
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - id: image
+        run: echo "image=${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: docker build -t "${{ steps.image.outputs.image }}" .
+
+      - name: Push image
+        run: docker push "${{ steps.image.outputs.image }}"
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build
+    environment: staging
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.DEPLOY_WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy staging revision
+        run: |
+          gcloud run deploy "${{ vars.CLOUD_RUN_SERVICE_STAGING }}" \
+            --image "${{ needs.build.outputs.image }}" \
+            --region "${REGION}" \
+            --platform managed \
+            --allow-unauthenticated \
+            --service-account "${{ vars.RUNTIME_SERVICE_ACCOUNT_STAGING }}" \
+            --vpc-connector "${{ vars.VPC_CONNECTOR_STAGING }}" \
+            --vpc-egress private-ranges-only \
+            --set-env-vars "APP_ENV=staging,NODE_ENV=production,DEFAULT_ROOM_ID=main-room,REQUIRE_REDIS=true,REQUIRE_FIRESTORE=true,ALLOW_IN_MEMORY_STATE=false,FIRESTORE_COLLECTION=${{ vars.FIRESTORE_COLLECTION }},REDIS_HOST=${{ vars.REDIS_HOST_STAGING }},REDIS_PORT=${{ vars.REDIS_PORT_STAGING }}" \
+            --set-secrets "GEMINI_API_KEY=${{ vars.GEMINI_SECRET_ID }}:latest" \
+            --min-instances "${{ vars.MIN_INSTANCES_STAGING }}" \
+            --max-instances "${{ vars.MAX_INSTANCES_STAGING }}" \
+            --concurrency 20 \
+            --timeout 3600 \
+            --cpu 2 \
+            --memory 2Gi \
+            --cpu-boost \
+            --quiet
+
+      - name: Smoke test staging
+        run: |
+          URL="$(gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE_STAGING }}" --region "${REGION}" --format='value(status.url)')"
+          curl -fsSL "${URL}/api/health"
+          curl -fsSL "${URL}/api/ready"
+
+  deploy-prod:
+    runs-on: ubuntu-latest
+    needs: [build, deploy-staging]
+    environment: production
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.DEPLOY_WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy production revision
+        run: |
+          gcloud run deploy "${{ vars.CLOUD_RUN_SERVICE_PROD }}" \
+            --image "${{ needs.build.outputs.image }}" \
+            --region "${REGION}" \
+            --platform managed \
+            --allow-unauthenticated \
+            --service-account "${{ vars.RUNTIME_SERVICE_ACCOUNT_PROD }}" \
+            --vpc-connector "${{ vars.VPC_CONNECTOR_PROD }}" \
+            --vpc-egress private-ranges-only \
+            --set-env-vars "APP_ENV=prod,NODE_ENV=production,DEFAULT_ROOM_ID=main-room,REQUIRE_REDIS=true,REQUIRE_FIRESTORE=true,ALLOW_IN_MEMORY_STATE=false,FIRESTORE_COLLECTION=${{ vars.FIRESTORE_COLLECTION }},REDIS_HOST=${{ vars.REDIS_HOST_PROD }},REDIS_PORT=${{ vars.REDIS_PORT_PROD }}" \
+            --set-secrets "GEMINI_API_KEY=${{ vars.GEMINI_SECRET_ID }}:latest" \
+            --min-instances "${{ vars.MIN_INSTANCES_PROD }}" \
+            --max-instances "${{ vars.MAX_INSTANCES_PROD }}" \
+            --concurrency 20 \
+            --timeout 3600 \
+            --cpu 2 \
+            --memory 2Gi \
+            --cpu-boost \
+            --quiet
+
+      - name: Smoke test production
+        run: |
+          URL="$(gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE_PROD }}" --region "${REGION}" --format='value(status.url)')"
+          curl -fsSL "${URL}/api/health"
+          curl -fsSL "${URL}/api/ready"

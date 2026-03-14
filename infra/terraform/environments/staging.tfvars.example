@@ -1,0 +1,12 @@
+project_id               = "your-gcp-project-id"
+environment              = "staging"
+region                   = "us-central1"
+github_repository        = "keshavdalmia10/the_cognitive_swarm"
+service_name             = "cognitive-swarm-staging"
+artifact_registry_repository_id = "cognitive-swarm"
+image                    = "us-central1-docker.pkg.dev/your-gcp-project-id/cognitive-swarm/the-cognitive-swarm:bootstrap"
+inject_gemini_secret     = false
+min_instances            = 1
+max_instances            = 10
+redis_tier               = "BASIC"
+redis_memory_gb          = 1
