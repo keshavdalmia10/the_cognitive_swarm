@@ -3,6 +3,22 @@ locals {
   connector_name               = "cs-${var.environment}-connector"
   github_pool_display_name     = "cs-${var.environment} gh pool"
   github_provider_display_name = "cs-${var.environment} gh provider"
+  terraform_ci_account_id      = substr(replace("${var.name}-terraform-ci", "_", "-"), 0, 30)
+  terraform_ci_roles = toset([
+    "roles/artifactregistry.admin",
+    "roles/compute.networkAdmin",
+    "roles/datastore.owner",
+    "roles/iam.serviceAccountAdmin",
+    "roles/iam.serviceAccountUser",
+    "roles/iam.workloadIdentityPoolAdmin",
+    "roles/redis.admin",
+    "roles/resourcemanager.projectIamAdmin",
+    "roles/run.admin",
+    "roles/secretmanager.admin",
+    "roles/serviceusage.serviceUsageAdmin",
+    "roles/storage.admin",
+    "roles/vpcaccess.admin",
+  ])
   labels = merge(var.labels, {
     app         = var.name
     environment = var.environment
@@ -123,6 +139,14 @@ resource "google_service_account" "deployer" {
   depends_on = [google_project_service.apis]
 }
 
+resource "google_service_account" "terraform_ci" {
+  count        = var.bootstrap_terraform_ci ? 1 : 0
+  account_id   = local.terraform_ci_account_id
+  display_name = "${var.name} terraform ci"
+
+  depends_on = [google_project_service.apis]
+}
+
 resource "google_project_iam_member" "runtime_secret_accessor" {
   project = var.project_id
   role    = "roles/secretmanager.secretAccessor"
@@ -189,12 +213,37 @@ resource "google_service_account_iam_member" "github_wif_deployer" {
   member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository/${var.github_repository}"
 }
 
+resource "google_project_iam_member" "terraform_ci_roles" {
+  for_each = var.bootstrap_terraform_ci ? local.terraform_ci_roles : toset([])
+  project  = var.project_id
+  role     = each.value
+  member   = "serviceAccount:${google_service_account.terraform_ci[0].email}"
+}
+
+resource "google_service_account_iam_member" "github_wif_terraform_ci" {
+  count              = var.bootstrap_terraform_ci ? 1 : 0
+  service_account_id = google_service_account.terraform_ci[0].name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository/${var.github_repository}"
+}
+
 resource "google_cloud_run_v2_service" "app" {
   name                = local.service_name
   location            = var.region
   deletion_protection = false
   ingress             = "INGRESS_TRAFFIC_ALL"
   labels              = local.labels
+
+  lifecycle {
+    # App revisions are rolled out by the deploy workflow, not terraform apply.
+    ignore_changes = [
+      client,
+      client_version,
+      template[0].containers[0].image,
+      template[0].labels,
+      template[0].vpc_access[0].connector,
+    ]
+  }
 
   template {
     service_account                  = google_service_account.runtime.email

@@ -50,8 +50,6 @@ jobs:
         include:
           - terraform_env: staging
             github_environment: staging
-          - terraform_env: prod
-            github_environment: production
     environment: ${{ matrix.github_environment }}
     defaults:
       run:
@@ -88,8 +86,6 @@ jobs:
         include:
           - terraform_env: staging
             github_environment: staging
-          - terraform_env: prod
-            github_environment: production
     environment: ${{ matrix.github_environment }}
     defaults:
       run:

@@ -20,6 +20,7 @@ Optional environment variables:
   TF_MAX_INSTANCES
   TF_REDIS_TIER
   TF_REDIS_MEMORY_GB
+  TF_BOOTSTRAP_TERRAFORM_CI
 EOF
 }
 
@@ -44,6 +45,7 @@ case "$terraform_env" in
     default_redis_tier="BASIC"
     default_redis_memory_gb="1"
     default_create_firestore_database="true"
+    default_bootstrap_terraform_ci="true"
     ;;
   prod)
     default_service_name="cognitive-swarm-prod"
@@ -52,6 +54,7 @@ case "$terraform_env" in
     default_redis_tier="STANDARD_HA"
     default_redis_memory_gb="5"
     default_create_firestore_database="false"
+    default_bootstrap_terraform_ci="false"
     ;;
   *)
     echo "Error: unsupported environment '$terraform_env'." >&2
@@ -70,6 +73,7 @@ min_instances="${TF_MIN_INSTANCES:-$default_min_instances}"
 max_instances="${TF_MAX_INSTANCES:-$default_max_instances}"
 redis_tier="${TF_REDIS_TIER:-$default_redis_tier}"
 redis_memory_gb="${TF_REDIS_MEMORY_GB:-$default_redis_memory_gb}"
+bootstrap_terraform_ci="${TF_BOOTSTRAP_TERRAFORM_CI:-$default_bootstrap_terraform_ci}"
 
 mkdir -p "$(dirname "$output_path")"
 
@@ -87,4 +91,5 @@ min_instances                   = ${min_instances}
 max_instances                   = ${max_instances}
 redis_tier                      = "${redis_tier}"
 redis_memory_gb                 = ${redis_memory_gb}
+bootstrap_terraform_ci          = ${bootstrap_terraform_ci}
 EOF

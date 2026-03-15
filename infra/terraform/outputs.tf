@@ -43,6 +43,16 @@ output "deploy_workload_identity_provider" {
   description = "GitHub Actions workload identity provider resource name."
 }
 
+output "terraform_ci_service_account_email" {
+  value       = try(google_service_account.terraform_ci[0].email, "")
+  description = "Terraform CI service account email."
+}
+
+output "terraform_ci_workload_identity_provider" {
+  value       = google_iam_workload_identity_pool_provider.github.name
+  description = "Workload identity provider used for Terraform CI."
+}
+
 output "redis_host" {
   value       = google_redis_instance.cache.host
   description = "Memorystore host IP for Cloud Run."

@@ -157,3 +157,9 @@ variable "env_vars" {
   description = "Additional environment variables injected into Cloud Run."
   default     = {}
 }
+
+variable "bootstrap_terraform_ci" {
+  type        = bool
+  description = "Create the Terraform CI service account and grant it project roles."
+  default     = false
+}
