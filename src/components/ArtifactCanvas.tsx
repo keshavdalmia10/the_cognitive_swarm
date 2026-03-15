@@ -18,6 +18,9 @@ const LABELS: Record<ArtifactDiagramType, string> = {
   journey: 'Journey Map',
 };
 
+const focusRingClass =
+  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#34D399]/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#050505]';
+
 export default function ArtifactCanvas({ artifact }: { artifact: ArtifactData | null }) {
   const [svgMarkup, setSvgMarkup] = useState('');
   const [renderError, setRenderError] = useState<string | null>(null);
@@ -102,53 +105,65 @@ export default function ArtifactCanvas({ artifact }: { artifact: ArtifactData | 
 
   if (!artifact) {
     return (
-      <div className="absolute inset-0 flex items-center justify-center text-white/30 font-mono text-sm p-8 text-center">
-        Waiting for Administrator to forge a topic-aware diagram...
+      <div className="absolute inset-0 flex items-center justify-center p-8 text-center">
+        <div className="max-w-md rounded-2xl border border-white/8 bg-[#0F0F11] px-8 py-10">
+          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl border border-[#A78BFA]/20 bg-[#A78BFA]/10 text-[#A78BFA]">
+            <BrainCircuit className="h-6 w-6" />
+          </div>
+          <p className="mt-5 text-[10px] font-mono uppercase tracking-[0.28em] text-white/35">Artifact Workspace</p>
+          <h3 className="mt-2 text-lg font-semibold text-white/90">Waiting for the next forged diagram</h3>
+          <p className="mt-3 text-sm leading-relaxed text-white/35">
+            When the administrator forges an artifact, it will appear here with pan and zoom controls.
+          </p>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="absolute inset-0 flex flex-col bg-[#050505]">
-      <div className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
-        <div className="flex min-w-0 items-center gap-3">
-          <BrainCircuit className="h-4 w-4 text-[#00FF00]" />
-          <div className="min-w-0">
-            <div className="truncate text-sm font-semibold text-white">{artifact.title}</div>
-            <div className="text-[10px] font-mono uppercase tracking-[0.24em] text-white/45">{diagramLabel}</div>
+      <div className="flex items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[#A78BFA]/20 bg-[#A78BFA]/10">
+            <BrainCircuit className="h-3.5 w-3.5 text-[#A78BFA]" />
           </div>
+          <span className="truncate text-sm font-medium text-white/85">{artifact.title}</span>
+          <span className="rounded-md border border-[#A78BFA]/20 bg-[#A78BFA]/10 px-2 py-0.5 text-[9px] font-mono uppercase tracking-[0.2em] text-[#A78BFA]">
+            {diagramLabel}
+          </span>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5">
           <button
             onClick={() => setScale((value) => Math.max(0.4, value - 0.1))}
-            className="rounded-full border border-white/10 bg-white/5 p-2 text-white/70 transition-colors hover:border-white/30 hover:text-white"
+            className={`${focusRingClass} rounded-lg border border-white/8 bg-white/5 p-1.5 text-white/50 transition-colors hover:bg-white/10 hover:text-white/80`}
             title="Zoom out"
           >
-            <ZoomOut className="h-3.5 w-3.5" />
+            <ZoomOut className="h-3 w-3" />
           </button>
           <button
             onClick={() => {
               setScale(1);
               setOffset({ x: 0, y: 0 });
             }}
-            className="rounded-full border border-white/10 bg-white/5 p-2 text-white/70 transition-colors hover:border-white/30 hover:text-white"
+            className={`${focusRingClass} rounded-lg border border-white/8 bg-white/5 p-1.5 text-white/50 transition-colors hover:bg-white/10 hover:text-white/80`}
             title="Reset view"
           >
-            <Search className="h-3.5 w-3.5" />
+            <Search className="h-3 w-3" />
           </button>
           <button
             onClick={() => setScale((value) => Math.min(2.5, value + 0.1))}
-            className="rounded-full border border-white/10 bg-white/5 p-2 text-white/70 transition-colors hover:border-white/30 hover:text-white"
+            className={`${focusRingClass} rounded-lg border border-white/8 bg-white/5 p-1.5 text-white/50 transition-colors hover:bg-white/10 hover:text-white/80`}
             title="Zoom in"
           >
-            <ZoomIn className="h-3.5 w-3.5" />
+            <ZoomIn className="h-3 w-3" />
           </button>
+          <span className="ml-1 text-[9px] font-mono text-white/30">{(scale * 100).toFixed(0)}%</span>
         </div>
       </div>
 
-      <div className="pointer-events-none absolute bottom-4 left-4 z-10 flex items-center gap-2 rounded-full border border-white/10 bg-black/55 px-3 py-1.5 text-[10px] font-mono uppercase tracking-[0.22em] text-white/55">
-        <Move className="h-3.5 w-3.5" />
-        Drag to pan, use controls to zoom
+      <div className="pointer-events-none absolute bottom-3 left-3 z-10 flex items-center gap-1.5 rounded-lg border border-white/8 bg-black/60 px-2.5 py-1 text-[9px] font-mono uppercase tracking-[0.2em] text-white/40 backdrop-blur-xl">
+        <Move className="h-3 w-3" />
+        Drag to pan
       </div>
 
       <div
@@ -159,8 +174,9 @@ export default function ArtifactCanvas({ artifact }: { artifact: ArtifactData | 
       >
         {renderError ? (
           <div className="absolute inset-0 flex items-center justify-center p-6 text-center">
-            <div className="rounded-2xl border border-red-500/30 bg-red-500/10 px-5 py-4 text-sm text-red-300">
-              Failed to render diagram: {renderError}
+            <div className="max-w-lg rounded-xl border border-[#FBBF24]/20 bg-[#FBBF24]/8 px-6 py-4 text-sm">
+              <p className="text-[10px] font-mono uppercase tracking-[0.24em] text-[#FBBF24]/70">Render Error</p>
+              <p className="mt-2 leading-relaxed text-[#FBBF24]/80">Failed to render diagram: {renderError}</p>
             </div>
           </div>
         ) : (

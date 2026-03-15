@@ -225,6 +225,7 @@ function buildSessionSummary(snapshot: SessionSnapshot) {
 async function startServer() {
   const app = express();
   const port = Number(process.env.PORT || 3001);
+  const host = process.env.HOST?.trim() || (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
   const deploymentConfig = getDeploymentConfig();
 
   console.log("Server starting. GEMINI_API_KEY is", process.env.GEMINI_API_KEY ? "SET" : "NOT SET");
@@ -1695,7 +1696,13 @@ async function startServer() {
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        host,
+        hmr: {
+          host,
+        },
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -1737,8 +1744,8 @@ async function startServer() {
     void shutdown();
   });
 
-  server.listen(port, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${port}`);
+  server.listen(port, host, () => {
+    console.log(`Server running on http://${host === "0.0.0.0" ? "localhost" : host}:${port}`);
   });
 }
 
