@@ -474,7 +474,9 @@ export default function App() {
 
   // Connect to Socket.IO
   useEffect(() => {
-    const newSocket = io();
+    const newSocket = io({
+      transports: ['websocket'],
+    });
     setSocket(newSocket);
 
     newSocket.on('connect', () => {

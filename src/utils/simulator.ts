@@ -15,7 +15,9 @@ const erIdeas = [
 
 export function startSimulation(numClients = 5, roomCode: string): () => void {
   console.log(`Starting ER Diagram simulation with ${numClients} virtual students in room ${roomCode}...`);
-  const sockets: Socket[] = Array.from({ length: numClients }).map(() => io());
+  const sockets: Socket[] = Array.from({ length: numClients }).map(() => io({
+    transports: ['websocket'],
+  }));
 
   let globalIdeas: any[] = [];
   let globalTopic = '';
