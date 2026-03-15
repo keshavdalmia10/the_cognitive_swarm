@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildFallbackArtifact, getDiagramLabel, inferDiagramType } from '../src/utils/artifactPolicy.ts';
+import { buildFallbackArtifact, getDiagramLabel, inferDiagramType, prioritizeArtifactIdeas } from '../src/utils/artifactPolicy.ts';
 
 test('inferDiagramType picks ER diagrams for database topics', () => {
   assert.equal(
@@ -33,6 +33,16 @@ test('inferDiagramType picks mind maps for concept-heavy brainstorming topics', 
 test('getDiagramLabel returns human-readable labels', () => {
   assert.equal(getDiagramLabel('erDiagram'), 'ER Diagram');
   assert.equal(getDiagramLabel('journey'), 'Journey Map');
+});
+
+test('prioritizeArtifactIdeas ranks by descending weight', () => {
+  const prioritized = prioritizeArtifactIdeas([
+    { text: 'Low', weight: 1 },
+    { text: 'High', weight: 5 },
+    { text: 'Mid', weight: 3 },
+  ]);
+
+  assert.deepEqual(prioritized.map((idea) => idea.text), ['High', 'Mid', 'Low']);
 });
 
 test('buildFallbackArtifact creates an ER diagram for database topics', () => {

@@ -1,23 +1,23 @@
 import express from "express";
 import http from "http";
 import path from "path";
+import { pathToFileURL } from "url";
 
 import dotenv from "dotenv";
 import { GoogleGenAI, LiveServerMessage, Modality, Type } from "@google/genai";
 import { createAdapter } from "@socket.io/redis-adapter";
 import { Server } from "socket.io";
-import { createServer as createViteServer } from "vite";
 
 import { generateRoomCode, isValidRoomCode, normalizeRoomCode } from "./src/server/roomCode.ts";
 import { createRedisClientFromConfig, getDeploymentConfig, type AppRedisClient } from "./src/server/runtimeConfig.ts";
+import type { DeploymentConfig } from "./src/server/runtimeConfig.ts";
 import { SessionStore } from "./src/server/sessionStore.ts";
 import type {
   IdeaRecord,
   SessionParticipant,
   SessionSnapshot,
-  SessionState,
 } from "./src/server/sessionTypes.ts";
-import { buildFallbackArtifact, getDiagramLabel, inferDiagramType } from "./src/utils/artifactPolicy.ts";
+import { buildFallbackArtifact, getDiagramLabel, inferDiagramType, prioritizeArtifactIdeas } from "./src/utils/artifactPolicy.ts";
 import type { ArtifactDiagramType, ArtifactIdea } from "./src/utils/artifactPolicy.ts";
 import {
   buildAudienceNudge,
@@ -45,7 +45,41 @@ interface RoomContext {
   synthesizerInterval: NodeJS.Timeout | null;
   criticInterval: NodeJS.Timeout | null;
   suggestionInterval: NodeJS.Timeout | null;
+  autoForgeTimer: NodeJS.Timeout | null;
+  autoForgeInFlight: boolean;
+  pendingAutoForge: boolean;
   runtimeEnabled: boolean;
+}
+
+interface ArtifactGenerationInput {
+  topic: string;
+  diagramType: ArtifactDiagramType;
+  diagramLabel: string;
+  summarizedIdeas: Array<{
+    cluster: string;
+    text: string;
+    weight: number;
+  }>;
+  prompt: string;
+}
+
+interface ArtifactGenerationResult {
+  title?: string;
+  diagramType?: string;
+  mermaid?: string;
+}
+
+interface StartServerOptions {
+  port?: number;
+  host?: string;
+  disableVite?: boolean;
+  deploymentConfig?: DeploymentConfig;
+  generateArtifact?: (input: ArtifactGenerationInput) => Promise<ArtifactGenerationResult>;
+}
+
+interface ServerHandle {
+  server: http.Server;
+  shutdown: () => Promise<void>;
 }
 
 function emitInlineAudio(
@@ -79,6 +113,7 @@ function getAI() {
 }
 
 const MAX_IDEAS = 200;
+const AUTO_FORGE_DEBOUNCE_MS = 750;
 const projectionMatrix = Array.from({ length: 3 }, () =>
   Array.from({ length: 3072 }, () => (Math.random() - 0.5) * 2),
 );
@@ -222,11 +257,60 @@ function buildSessionSummary(snapshot: SessionSnapshot) {
   };
 }
 
-async function startServer() {
+function buildArtifactPrompt(
+  topic: string,
+  diagramType: ArtifactDiagramType,
+  diagramLabel: string,
+  summarizedIdeas: ArtifactGenerationInput["summarizedIdeas"],
+) {
+  return `You are a diagram synthesis agent.
+        Topic: "${topic}".
+        Chosen diagram type: "${diagramType}" (${diagramLabel}).
+        Ideas: ${JSON.stringify(summarizedIdeas)}.
+
+        Produce a Mermaid diagram that fits the topic, not a generic box-and-arrow tree.
+        Return strict JSON with:
+        - title: string
+        - diagramType: string
+        - mermaid: string
+
+        Requirements:
+        - diagramType must stay exactly "${diagramType}".
+        - mermaid must start with the Mermaid syntax for ${diagramType}.
+        - Treat idea weight as global support and priority.
+        - Privilege higher-weight ideas when choosing what to include, what to make central, and which relationships deserve detail.
+        - If you need to omit ideas for readability, omit lower-weight ideas before higher-weight ones.
+        - Lower-weight ideas should only appear when they help connect or clarify the higher-weight ideas.
+        - Use the topic semantics to choose the diagram structure.
+        - Keep the diagram readable and under 18 meaningful nodes or entities.
+        - Do not use markdown fences.
+        - For erDiagram: create entities and relationships, not generic steps.
+        - For flowchart: create steps, decisions, or transitions.
+        - For classDiagram: create classes and relationships.
+        - For mindmap: create a themed hierarchy.
+        - For journey: create stages or moments of experience.`;
+}
+
+function toArtifactIdeas(ideas: IdeaRecord[]): ArtifactIdea[] {
+  return ideas.map((idea) => ({
+    text: idea.text,
+    cluster: idea.cluster,
+    weight: idea.weight,
+  }));
+}
+
+export async function startServer(options: StartServerOptions = {}): Promise<ServerHandle> {
   const app = express();
-  const port = Number(process.env.PORT || 3001);
-  const host = process.env.HOST?.trim() || (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
-  const deploymentConfig = getDeploymentConfig();
+  const port = options.port ?? Number(process.env.PORT || 3001);
+  const host =
+    options.host ??
+    process.env.HOST?.trim() ??
+    (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
+  const deploymentConfig = options.deploymentConfig ?? getDeploymentConfig();
+  const shouldMountVite =
+    !options.disableVite &&
+    process.env.DISABLE_VITE_DEV_SERVER !== "true" &&
+    process.env.NODE_ENV !== "production";
 
   console.log("Server starting. GEMINI_API_KEY is", process.env.GEMINI_API_KEY ? "SET" : "NOT SET");
   logToFile(`Server starting. GEMINI_API_KEY is ${process.env.GEMINI_API_KEY ? "SET" : "NOT SET"}`);
@@ -271,6 +355,9 @@ async function startServer() {
     roomContext.synthesizerInterval = null;
     roomContext.criticInterval = null;
     roomContext.suggestionInterval = null;
+    if (roomContext.autoForgeTimer) clearTimeout(roomContext.autoForgeTimer);
+    roomContext.autoForgeTimer = null;
+    roomContext.pendingAutoForge = false;
     roomContext.runtimeEnabled = false;
 
     if (roomContext.anchorLiveSessionPromise) {
@@ -313,6 +400,9 @@ async function startServer() {
       synthesizerInterval: null,
       criticInterval: null,
       suggestionInterval: null,
+      autoForgeTimer: null,
+      autoForgeInFlight: false,
+      pendingAutoForge: false,
       runtimeEnabled: false,
     };
     roomContexts.set(normalizedRoomCode, roomContext);
@@ -550,48 +640,43 @@ async function startServer() {
   async function forgeArtifactFromTopic(topic: string, ideas: ArtifactIdea[]) {
     const diagramType = inferDiagramType(topic, ideas);
     const diagramLabel = getDiagramLabel(diagramType);
-    const summarizedIdeas = ideas
-      .sort((left, right) => (right.weight || 0) - (left.weight || 0))
-      .slice(0, 14)
+    if (process.env.FORCE_FALLBACK_ARTIFACT === "true") {
+      return buildFallbackArtifact(topic, ideas, diagramType);
+    }
+    const summarizedIdeas = prioritizeArtifactIdeas(ideas, 14)
       .map((idea) => ({
         cluster: idea.cluster || "General",
         text: idea.text,
         weight: idea.weight || 1,
       }));
+    const prompt = buildArtifactPrompt(topic, diagramType, diagramLabel, summarizedIdeas);
 
     try {
-      const response = await withTimeout(
-        getAI().models.generateContent({
-          model: "gemini-3.1-flash-lite-preview",
-          contents: `You are a diagram synthesis agent.
-        Topic: "${topic}".
-        Chosen diagram type: "${diagramType}" (${diagramLabel}).
-        Ideas: ${JSON.stringify(summarizedIdeas)}.
-
-        Produce a Mermaid diagram that fits the topic, not a generic box-and-arrow tree.
-        Return strict JSON with:
-        - title: string
-        - diagramType: string
-        - mermaid: string
-
-        Requirements:
-        - diagramType must stay exactly "${diagramType}".
-        - mermaid must start with the Mermaid syntax for ${diagramType}.
-        - Use the topic semantics to choose the diagram structure.
-        - Keep the diagram readable and under 18 meaningful nodes or entities.
-        - Do not use markdown fences.
-        - For erDiagram: create entities and relationships, not generic steps.
-        - For flowchart: create steps, decisions, or transitions.
-        - For classDiagram: create classes and relationships.
-        - For mindmap: create a themed hierarchy.
-        - For journey: create stages or moments of experience.`,
-          config: { responseMimeType: "application/json" },
-        }),
-        20000,
-        "forgeArtifactFromTopic",
-      );
-
-      const result = JSON.parse(response.text || "{}");
+      const result = options.generateArtifact
+        ? await withTimeout(
+            options.generateArtifact({
+              topic,
+              diagramType,
+              diagramLabel,
+              summarizedIdeas,
+              prompt,
+            }),
+            20000,
+            "forgeArtifactFromTopic",
+          )
+        : JSON.parse(
+            (
+              await withTimeout(
+                getAI().models.generateContent({
+                  model: "gemini-3.1-flash-lite-preview",
+                  contents: prompt,
+                  config: { responseMimeType: "application/json" },
+                }),
+                20000,
+                "forgeArtifactFromTopic",
+              )
+            ).text || "{}",
+          );
       const mermaid = String(result.mermaid || "").trim();
       const title = String(result.title || topic || diagramLabel).trim();
       const generatedType = String(result.diagramType || "").trim() as ArtifactDiagramType;
@@ -609,6 +694,86 @@ async function startServer() {
       console.error("Artifact generation failed, using fallback:", error);
       return buildFallbackArtifact(topic, ideas, diagramType);
     }
+  }
+
+  async function forgeAndBroadcastArtifact(roomContext: RoomContext) {
+    const snapshot = await roomContext.store.getSnapshot();
+    if (snapshot.room.status !== "active") {
+      return null;
+    }
+
+    const artifact = await forgeArtifactFromTopic(
+      snapshot.state.topic || "Brainstorming Session",
+      toArtifactIdeas(snapshot.state.ideas),
+    );
+
+    await roomContext.store.mutate((mutableSnapshot) => {
+      if (mutableSnapshot.room.status !== "active") {
+        return;
+      }
+      mutableSnapshot.state.artifactData = artifact;
+    });
+
+    io.to(roomContext.roomCode).emit("artifact_updated", artifact);
+    return artifact;
+  }
+
+  async function runAutoForge(roomContext: RoomContext) {
+    roomContext.autoForgeTimer = null;
+
+    const snapshot = await roomContext.store.getSnapshot();
+    if (
+      snapshot.room.status !== "active" ||
+      snapshot.state.phase !== "forging" ||
+      snapshot.state.ideas.length === 0
+    ) {
+      roomContext.pendingAutoForge = false;
+      return;
+    }
+
+    if (roomContext.autoForgeInFlight) {
+      roomContext.pendingAutoForge = true;
+      return;
+    }
+
+    roomContext.autoForgeInFlight = true;
+    try {
+      await forgeAndBroadcastArtifact(roomContext);
+    } catch (error) {
+      console.error("Auto forge failed:", error);
+    } finally {
+      roomContext.autoForgeInFlight = false;
+      if (roomContext.pendingAutoForge) {
+        roomContext.pendingAutoForge = false;
+        roomContext.autoForgeTimer = setTimeout(() => {
+          void runAutoForge(roomContext);
+        }, AUTO_FORGE_DEBOUNCE_MS);
+      }
+    }
+  }
+
+  async function scheduleAutoForge(roomContext: RoomContext) {
+    const snapshot = await roomContext.store.getSnapshot();
+    if (
+      snapshot.room.status !== "active" ||
+      snapshot.state.phase !== "forging" ||
+      snapshot.state.ideas.length === 0
+    ) {
+      if (roomContext.autoForgeTimer) {
+        clearTimeout(roomContext.autoForgeTimer);
+        roomContext.autoForgeTimer = null;
+      }
+      roomContext.pendingAutoForge = false;
+      return;
+    }
+
+    roomContext.pendingAutoForge = false;
+    if (roomContext.autoForgeTimer) {
+      clearTimeout(roomContext.autoForgeTimer);
+    }
+    roomContext.autoForgeTimer = setTimeout(() => {
+      void runAutoForge(roomContext);
+    }, AUTO_FORGE_DEBOUNCE_MS);
   }
 
   async function scheduleIdeaResearch(roomCode: string, ideaId: string, ideaText: string, authorId: string) {
@@ -1601,6 +1766,7 @@ async function startServer() {
       socket.emit("credits_updated", creditsPayload);
       io.to(activeRoom.roomCode).emit("idea_weight_updated", { ideaId: data.ideaId, weight: updatedWeight });
       io.to(activeRoom.roomCode).emit("ideas_batch_updated", [updatedIdea]);
+      void scheduleAutoForge(activeRoom.roomContext);
     });
 
     socket.on("edit_idea", async (data: { id: string; text: string; cluster: string; textChanged?: boolean }) => {
@@ -1641,18 +1807,7 @@ async function startServer() {
       const activeRoom = await getActiveRoom(socket);
       if (!activeRoom) return;
       try {
-        const artifact = await forgeArtifactFromTopic(
-          activeRoom.snapshot.state.topic || "Brainstorming Session",
-          activeRoom.snapshot.state.ideas.map((idea) => ({
-            text: idea.text,
-            cluster: idea.cluster,
-            weight: idea.weight,
-          })),
-        );
-        await activeRoom.roomContext.store.mutate((mutableSnapshot) => {
-          mutableSnapshot.state.artifactData = artifact;
-        });
-        io.to(activeRoom.roomCode).emit("artifact_updated", artifact);
+        await forgeAndBroadcastArtifact(activeRoom.roomContext);
       } catch (error: any) {
         console.error("Artifact forge failed:", error);
         socket.emit("error", { message: error.message || "Failed to forge topic-aware artifact." });
@@ -1696,7 +1851,8 @@ async function startServer() {
     });
   });
 
-  if (process.env.NODE_ENV !== "production") {
+  if (shouldMountVite) {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -1726,29 +1882,64 @@ async function startServer() {
     });
   }
 
-  const shutdown = async () => {
-    await Promise.allSettled(
-      Array.from(roomContexts.values()).map(async (roomContext) => {
-        if (roomContext.anchorLiveSessionPromise) {
-          await roomContext.anchorLiveSessionPromise.then((session) => session.close()).catch(() => undefined);
-        }
-        await roomContext.store.close();
-      }),
-    );
-    await Promise.allSettled(shutdownClients.map((client) => client.quit()));
-    server.close();
+  let shutdownPromise: Promise<void> | null = null;
+  const onSigTerm = () => {
+    void shutdown();
+  };
+  const onSigInt = () => {
+    void shutdown();
   };
 
-  process.on("SIGTERM", () => {
-    void shutdown();
-  });
-  process.on("SIGINT", () => {
-    void shutdown();
+  const shutdown = async () => {
+    if (shutdownPromise) {
+      return shutdownPromise;
+    }
+
+    shutdownPromise = (async () => {
+      process.off("SIGTERM", onSigTerm);
+      process.off("SIGINT", onSigInt);
+
+      await Promise.allSettled(
+        Array.from(roomContexts.values()).map(async (roomContext) => {
+          if (roomContext.autoForgeTimer) {
+            clearTimeout(roomContext.autoForgeTimer);
+            roomContext.autoForgeTimer = null;
+          }
+          if (roomContext.anchorLiveSessionPromise) {
+            await roomContext.anchorLiveSessionPromise.then((session) => session.close()).catch(() => undefined);
+          }
+          await roomContext.store.close();
+        }),
+      );
+      await Promise.allSettled(shutdownClients.map((client) => client.quit()));
+      await new Promise<void>((resolve) => {
+        io.close(() => resolve());
+      });
+    })();
+
+    return shutdownPromise;
+  };
+
+  process.on("SIGTERM", onSigTerm);
+  process.on("SIGINT", onSigInt);
+
+  await new Promise<void>((resolve) => {
+    server.listen(port, host, () => {
+      console.log(`Server running on http://${host === "0.0.0.0" ? "localhost" : host}:${port}`);
+      resolve();
+    });
   });
 
-  server.listen(port, host, () => {
-    console.log(`Server running on http://${host === "0.0.0.0" ? "localhost" : host}:${port}`);
-  });
+  return {
+    server,
+    shutdown,
+  };
 }
 
-await startServer();
+const entrypoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : null;
+if (entrypoint && import.meta.url === entrypoint) {
+  startServer().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

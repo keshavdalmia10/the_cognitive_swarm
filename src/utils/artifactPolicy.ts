@@ -42,11 +42,15 @@ function toIdentifier(value: string, fallback: string) {
   return normalized || fallback;
 }
 
-function summarizeIdeas(ideas: ArtifactIdea[]) {
+export function prioritizeArtifactIdeas(ideas: ArtifactIdea[], limit = 12) {
   return ideas
     .filter((idea) => idea.text)
     .sort((a, b) => (b.weight || 0) - (a.weight || 0))
-    .slice(0, 12);
+    .slice(0, limit);
+}
+
+function summarizeIdeas(ideas: ArtifactIdea[]) {
+  return prioritizeArtifactIdeas(ideas, 12);
 }
 
 export function getDiagramLabel(type: ArtifactDiagramType) {
