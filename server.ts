@@ -1570,6 +1570,7 @@ async function startServer() {
       const activeRoom = await getActiveRoom(socket);
       if (!activeRoom) return;
       let updatedWeight: number | null = null;
+      let updatedIdea: IdeaRecord | null = null;
       let creditsPayload: { credits: number; votes: Record<string, number> } | null = null;
 
       await activeRoom.roomContext.store.mutate((snapshot) => {
@@ -1593,12 +1594,13 @@ async function startServer() {
 
         creditsPayload = { credits: participant.credits, votes: participant.votes };
         updatedWeight = idea.weight;
+        updatedIdea = { ...idea };
       });
 
-      if (!creditsPayload || updatedWeight === null) return;
+      if (!creditsPayload || updatedWeight === null || !updatedIdea) return;
       socket.emit("credits_updated", creditsPayload);
       io.to(activeRoom.roomCode).emit("idea_weight_updated", { ideaId: data.ideaId, weight: updatedWeight });
-      io.to(activeRoom.roomCode).emit("ideas_batch_updated", [{ id: data.ideaId, weight: updatedWeight }]);
+      io.to(activeRoom.roomCode).emit("ideas_batch_updated", [updatedIdea]);
     });
 
     socket.on("edit_idea", async (data: { id: string; text: string; cluster: string; textChanged?: boolean }) => {

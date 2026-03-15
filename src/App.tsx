@@ -593,7 +593,7 @@ export default function App() {
     newSocket.on('ideas_batch_updated', (updatedIdeas: any[]) => {
       setIdeas((prev) => prev.map(i => {
         const updated = updatedIdeas.find(u => u.id === i.id);
-        return updated ? updated : i;
+        return updated ? { ...i, ...updated } : i;
       }));
     });
 
