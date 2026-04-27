@@ -6,6 +6,24 @@ The app uses Gemini in two ways:
 - **Gemini Live** for low-latency, full-duplex voice interaction with the anchor (listening, speaking, interruption-aware).
 - **Gemini model calls** for idea research, connection synthesis, devil's advocate critiques, artifact generation, and embeddings.
 
+## Screenshots
+
+**Explore phase — 3D idea swarm** (multiple participants, ideas clustered by semantic similarity)
+
+![Explore phase swarm](docs/screenshots/explore-swarm.png)
+
+**Explore phase — idea detail panel** (admin editing a node; AI anchor cue visible at bottom)
+
+![Explore phase admin](docs/screenshots/explore-admin.png)
+
+**Vote phase — Mechanism Duel** (quadratic voting surfaces genuine group preference)
+
+![Vote phase](docs/screenshots/vote.png)
+
+**Forge phase — generated artifact** (class diagram synthesized from top-weighted ideas)
+
+![Forge artifact](docs/screenshots/forge-artifact.png)
+
 ## Core Capabilities
 
 - Room-based sessions with admin/participant roles and 6-character room codes
